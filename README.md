@@ -30,7 +30,18 @@ No server, no accounts, no file uploads — it's a static page. For the
 photo you upload, it:
 
 1. Thresholds it to a binary foreground mask (ink and borders both count as
-   "foreground," blank paper doesn't).
+   "foreground," blank paper doesn't) — using a local, per-neighborhood
+   threshold (`cv.adaptiveThreshold`) by default rather than one value for
+   the whole photo. A real photographed page is rarely lit perfectly evenly;
+   a single global threshold tuned for the brighter side can fail to tell
+   border lines from paper at all on a shadowed side. Confirmed on a
+   synthetic page with a left-to-right lighting gradient: a global threshold
+   found 487 of 800 boxes (89 on the shadowed side vs. 398 on the bright
+   side); the adaptive one found all 800. Classification has the same
+   problem one level up — a single page-wide "blank vs. marked" split can't
+   tell "darker because shadowed" apart from "darker because marked" —
+   solved by computing that split per spatial region instead of once
+   globally (see step 5).
 2. Finds every closed shape in that mask as a contour
    (`cv.findContours`, via [OpenCV.js](https://docs.opencv.org/4.x/d5/d10/tutorial_js_root.html)),
    using `RETR_CCOMP` and keeping each box's enclosed interior (a "hole" in
@@ -55,19 +66,28 @@ photo you upload, it:
    has that; a disconnected ink blob or a clipped fragment doesn't).
 4. For each box kept, crops an inset region (avoiding its own border) and
    measures how dark it is on average.
-5. Finds the natural split between "blank" and "marked" scores via a
-   second, cell-level Otsu threshold over all the boxes' darkness scores
-   (not a fixed cutoff against pure white) — self-calibrates to whatever a
-   blank box actually looks like in this specific photo (handles non-white
-   cell fills, shadows, scan tint) and to whatever fraction of boxes are
-   actually marked.
+5. Finds the natural split between "blank" and "marked" scores via Otsu
+   applied to the array of per-cell darkness scores (not pixels, and not a
+   fixed cutoff against pure white) — self-calibrating to whatever a blank
+   box actually looks like (non-white cell fills, shadows, scan tint all
+   handled) and to whatever fraction of boxes are actually marked. Computed
+   per spatial tile across the photo rather than once for the whole page,
+   for the lighting-unevenness reason in step 1 — a small or simple photo
+   just reduces to one tile, i.e. one global split.
 
 This is a "how dark is it" measurement, not real OCR — it doesn't care
 whether the mark is an X, a checkmark, or a scribble, just whether there's
 visible ink in the box. Validated against synthetic ground-truth grids
 across varied pen widths, cell sizes, rotation, mark density from 5%-70%,
-non-white cell fills, zero-gap touching borders, and printed reference
-numbers with their own enclosed holes sitting next to every box.
+non-white cell fills, near-zero-gap touching borders, printed reference
+numbers with their own enclosed holes sitting next to every box, and a
+simulated lighting gradient across an 800-box page.
+
+**Known trade-off**: the adaptive threshold that fixes uneven lighting is
+very slightly worse than a single global threshold at the most extreme
+case of literally zero pixels between two boxes' borders (in testing, 94
+boxes found out of 100 vs. 100/100). If you give a known total, the app
+tries both methods and keeps whichever one actually matches your photo.
 
 ## Running locally
 
