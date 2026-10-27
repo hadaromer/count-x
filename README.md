@@ -4,7 +4,7 @@ Upload a photo of a grid of boxes (like a bingo card, attendance sheet, or
 survey form) and count how many are marked with an X. Runs entirely in your
 browser — nothing gets uploaded anywhere.
 
-**Live site:** _(set after first GitHub Pages deploy — see below)_
+**Live site:** https://hadaromer.github.io/count-x/
 
 ## How to use it
 
