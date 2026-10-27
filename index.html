@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Count X</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Count X</h1>
+    <p class="subtitle">Upload a photo of a checkbox grid. Mark each block's four corners, tell it the rows/columns, and it counts the X's.</p>
+  </header>
+
+  <main>
+    <section class="panel">
+      <div id="status" class="status">Loading OpenCV&hellip;</div>
+
+      <div class="controls-row">
+        <label class="file-label">
+          <input type="file" id="fileInput" accept="image/*" />
+          <span id="fileLabelText">Choose photo</span>
+        </label>
+        <button id="resetBtn" class="btn btn-ghost" disabled>Reset</button>
+      </div>
+
+      <div class="controls-row" id="pickingControls" hidden>
+        <button id="addRegionBtn" class="btn">+ Add region</button>
+        <button id="undoCornerBtn" class="btn btn-ghost" disabled>Undo last corner</button>
+        <button id="cancelRegionBtn" class="btn btn-ghost" disabled>Cancel</button>
+        <span id="pickHint" class="hint"></span>
+      </div>
+
+      <div class="canvas-wrap">
+        <canvas id="viewCanvas"></canvas>
+      </div>
+
+      <div id="pendingForm" class="pending-form" hidden>
+        <strong>New region</strong> &mdash; how many rows and columns of boxes did you click around?
+        <label>Rows <input type="number" id="pendingRows" min="1" max="100" value="8" /></label>
+        <label>Columns <input type="number" id="pendingCols" min="1" max="100" value="10" /></label>
+        <button id="confirmRegionBtn" class="btn">Add</button>
+        <button id="discardRegionBtn" class="btn btn-ghost">Discard</button>
+      </div>
+
+      <div id="regionsSection" hidden>
+        <h2>Regions</h2>
+        <table id="regionsTable">
+          <thead><tr><th>#</th><th>Rows × Cols</th><th>Cells</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+
+        <div class="controls-row">
+          <label class="threshold-label">
+            Mark sensitivity
+            <input type="range" id="thresholdSlider" min="1" max="40" value="7" />
+            <span id="thresholdValue">7%</span>
+          </label>
+          <button id="processBtn" class="btn btn-primary">Count X's</button>
+        </div>
+      </div>
+
+      <div id="resultsSection" hidden>
+        <h2>Results</h2>
+        <div id="totalResult" class="total-result"></div>
+        <div id="regionResults" class="region-results"></div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>Runs entirely in your browser &mdash; nothing is uploaded anywhere.</p>
+  </footer>
+
+  <script>
+    // opencv.js looks for a pre-existing Module config; onRuntimeInitialized
+    // fires once the WASM is actually compiled and ready, unlike the script
+    // tag's own onload (which fires as soon as the JS wrapper downloads).
+    var Module = {
+      onRuntimeInitialized() {
+        window.dispatchEvent(new Event("opencv-ready"));
+      }
+    };
+  </script>
+  <script async src="https://docs.opencv.org/4.9.0/opencv.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
