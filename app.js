@@ -190,12 +190,16 @@ function findCellsBestMatch(canvas, expectedTotal) {
 // fill ratio (contour area vs. its own bounding-box area) that confirms
 // it's a filled hole shape, not a sliver/fragment.
 //
-// Classification: per cell, measure darkness in an inset crop, then find
-// the natural split between "blank" and "marked" scores via a second,
-// cell-level Otsu threshold (not pixel-level) — this self-calibrates to
-// whatever a blank box actually looks like in this specific photo (handles
-// non-white cell fills, shadows, scan tint) and to whatever fraction of
-// boxes are actually marked, rather than assuming marks are a minority.
+// Classification: per cell, measure two independent signals in an inset
+// crop — grayscale darkness (pen ink, pencil) and "greenness" (G channel
+// vs. the other two, for highlighter-style marks that are barely darker
+// than blank paper and so are invisible to a pure darkness score). A cell's
+// mark score is the stronger of the two. Then find the natural split
+// between "blank" and "marked" scores via a second, cell-level Otsu
+// threshold (not pixel-level) — this self-calibrates to whatever a blank
+// box actually looks like in this specific photo (handles non-white cell
+// fills, shadows, scan tint) and to whatever fraction of boxes are
+// actually marked, rather than assuming marks are a minority.
 function findCells(canvas, minSizeFrac) {
   const src = cv.imread(canvas);
   const gray = new cv.Mat();
@@ -260,14 +264,30 @@ function findCells(canvas, minSizeFrac) {
     const insetY = Math.round(c.h * insetFrac);
     const rw = c.w - 2 * insetX;
     const rh = c.h - 2 * insetY;
-    if (rw <= 0 || rh <= 0) { c.ink = 0; continue; }
-    const roi = gray.roi(new cv.Rect(c.x + insetX, c.y + insetY, rw, rh));
+    if (rw <= 0 || rh <= 0) { c.ink = 0; c.green = 0; c.score = 0; continue; }
+    const rect = new cv.Rect(c.x + insetX, c.y + insetY, rw, rh);
+
+    const roi = gray.roi(rect);
     const meanVal = cv.mean(roi)[0];
     roi.delete();
     c.ink = 1 - meanVal / 255;
+
+    // Marks on this form aren't just dark pen ink — many are a green
+    // highlighter, which grayscale darkness barely registers (highlighter
+    // is light) and can't tell apart from the form's own printed grid
+    // lines/shadow anyway. Measure how much the interior's average color
+    // leans green (G channel vs. the other two) as a second, independent
+    // signal; a cell counts as marked if *either* signal is strong.
+    const roiColor = src.roi(rect);
+    const meanColor = cv.mean(roiColor);
+    roiColor.delete();
+    const greenDiff = meanColor[1] - (meanColor[0] + meanColor[2]) / 2;
+    c.green = Math.max(0, Math.min(1, greenDiff / 50));
+
+    c.score = Math.max(c.ink, c.green);
   }
 
-  const cellThresh = cells.length >= 2 ? otsu1d(cells.map((c) => c.ink)) : 0.5;
+  const cellThresh = cells.length >= 2 ? otsu1d(cells.map((c) => c.score)) : 0.5;
 
   src.delete(); gray.delete(); blurred.delete(); binary.delete();
   contours.delete(); hierarchy.delete();
@@ -323,7 +343,7 @@ function renderResult(expectedTotal) {
   const effectiveThresh = state.cellThresh + state.adjust;
   let count = 0;
   for (const c of state.cells) {
-    const marked = c.ink >= effectiveThresh;
+    const marked = c.score >= effectiveThresh;
     if (marked) count++;
     state.viewCtx.strokeStyle = marked ? "#16a34a" : "rgba(37,99,235,0.35)";
     state.viewCtx.lineWidth = marked ? 3 : 1.5;
@@ -347,11 +367,11 @@ function buildDiagnosticsText() {
   const W = state.workCanvas.width, H = state.workCanvas.height;
   const effectiveThresh = state.cellThresh + state.adjust;
 
-  // ink-score histogram, 20 buckets 0..1
+  // combined mark-score histogram, 20 buckets 0..1
   const bucketCount = 20;
   const buckets = new Array(bucketCount).fill(0);
   for (const c of cells) {
-    const b = Math.min(bucketCount - 1, Math.max(0, Math.floor(c.ink * bucketCount)));
+    const b = Math.min(bucketCount - 1, Math.max(0, Math.floor(c.score * bucketCount)));
     buckets[b]++;
   }
   const histLines = buckets.map((n, i) => {
@@ -375,7 +395,7 @@ function buildDiagnosticsText() {
   const med = (arr) => arr[Math.floor(arr.length / 2)];
 
   const sample = cells.slice(0, 25).map((c) =>
-    `  x=${c.x} y=${c.y} w=${c.w} h=${c.h} ink=${c.ink.toFixed(3)} marked=${c.ink >= effectiveThresh}`
+    `  x=${c.x} y=${c.y} w=${c.w} h=${c.h} ink=${c.ink.toFixed(3)} green=${c.green.toFixed(3)} score=${c.score.toFixed(3)} marked=${c.score >= effectiveThresh}`
   );
 
   return [
@@ -387,9 +407,9 @@ function buildDiagnosticsText() {
     `Detected cells: ${cells.length}`,
     `Cell size: width min=${widths[0]} median=${med(widths)} max=${widths[widths.length - 1]} | height min=${heights[0]} median=${med(heights)} max=${heights[heights.length - 1]}`,
     `Classification threshold (auto + slider adjust): ${effectiveThresh.toFixed(3)} (auto=${state.cellThresh.toFixed(3)}, slider adjust=${state.adjust.toFixed(3)})`,
-    `Marked: ${cells.filter((c) => c.ink >= effectiveThresh).length} / ${cells.length}`,
+    `Marked: ${cells.filter((c) => c.score >= effectiveThresh).length} / ${cells.length}`,
     ``,
-    `Ink-score histogram (0=white, 1=black):`,
+    `Mark-score histogram (0=blank, 1=marked; score = max of grayscale ink and greenness):`,
     ...histLines,
     ``,
     `Spatial density (cells found per region, image divided into a ${gridCols}x${gridRows} grid, top-left to bottom-right):`,
