@@ -50,23 +50,25 @@ photo you upload, it:
    undercounts. A box's hole stays correctly segmented even when the
    surrounding mesh is fully fused, so this holds up regardless of how
    tightly packed the boxes are.
-4. Handles boxes whose hole got sliced into several undersized fragments
-   (an X touching the border at multiple points): fragments sharing a
-   parent border whose *combined* footprint is cell-sized get merged into
-   one candidate — but only when none of that parent's fragments already
-   qualified alone, so a genuinely fused mesh of many separate blank boxes
-   (which legitimately share one parent) never gets merged into a single
-   giant box.
-5. Keeps only the candidates big enough to plausibly be a box a person
-   could mark with a pen (a fixed minimum size relative to the photo) —
-   printed reference numbers/labels often contain characters like 0, 8, 9,
-   or 6 that have their own enclosed hole, identical in shape to a
-   checkbox's; this is what tells them apart, since a label's internal
-   counter is reliably much smaller than a real box, no matter how many of
-   them there are. Among what's left: closeness to the remaining pool's
-   median size, a reasonable aspect ratio, and a fill ratio (contour area
-   vs. its own bounding box) high enough to confirm a real hole shape, not
-   a sliver fragment.
+4. Keeps only the candidates big enough to plausibly be a box a person
+   could mark with a pen, with a high fill ratio (contour area vs. its own
+   bounding box) and a close-to-square aspect ratio. A real box hole after
+   thinning is a near-complete rectangle; a printed label character's hole
+   (0, 6, 8, 9 all have one) almost never reaches that fill ratio even
+   when its size happens to overlap a small box's — fill ratio and shape
+   turn out to separate the two far more reliably than size alone,
+   especially at low photo resolution where a dense form's label text and
+   its checkboxes can be close in size.
+5. Handles boxes whose hole got sliced into several undersized fragments
+   by a mark that touches the border at multiple points (e.g. an X corner
+   to corner): groups leftover fragments by actual spatial adjacency
+   (bounding boxes touching or overlapping within a tight tolerance, far
+   smaller than the real gap between adjacent boxes) rather than by
+   `findContours`' own parent index, which turned out not to be reliable
+   evidence of belonging to the same cell. A group's combined footprint is
+   accepted as one cell if it's plausibly box-shaped and sized — but a
+   *lone* low-fill fragment is left alone rather than merged, since on its
+   own it's more likely a digit than a sliced-open box.
 6. For each box kept, crops an inset region (avoiding its own border) and
    measures two independent signals: grayscale darkness (pen/pencil ink)
    and "greenness" (how much the average color leans green — for

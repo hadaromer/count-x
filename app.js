@@ -251,9 +251,16 @@ function findCells(canvas, minSizeFrac) {
   const minDim = minSizeFrac * Math.min(canvas.width, canvas.height);
   const pipeline = { rawContours: contours.size(), holeContours: 0, afterMinSize: 0, mergedFragments: 0, afterShapeFilter: 0 };
 
-  const byParent = new Map(); // parentIdx -> [{x,y,w,h,area}]
+  // A real box hole, after thinning, is a near-complete rectangle: high
+  // fill ratio (contour area vs. its own bounding box), close to square. A
+  // printed label character's hole (0, 6, 8, 9) almost never reaches that
+  // fill ratio even when its size overlaps a small box — so this is a much
+  // more reliable box/digit discriminator than size alone (sizes can
+  // genuinely overlap at low photo resolution; fill ratio rarely does).
+  const FILL_MIN = 0.65, ASPECT_LO = 0.7, ASPECT_HI = 1.4;
+
   const pass1 = [];
-  const coveredParents = new Set();
+  const leftover = []; // fragments that failed pass1 on their own — merge candidates
   for (let i = 0; i < contours.size(); i++) {
     const cnt = contours.get(i);
     const parent = hierarchy.data32S[i * 4 + 3];
@@ -262,18 +269,17 @@ function findCells(canvas, minSizeFrac) {
       const rect = cv.boundingRect(cnt);
       const area = cv.contourArea(cnt);
       if (rect.width >= 4 && rect.height >= 4) {
-        if (!byParent.has(parent)) byParent.set(parent, []);
-        byParent.get(parent).push({ x: rect.x, y: rect.y, w: rect.width, h: rect.height, area });
-      }
-      if (rect.width >= minDim && rect.height >= minDim) {
-        pipeline.afterMinSize++;
         const rectArea = rect.width * rect.height;
-        pass1.push({
-          x: rect.x, y: rect.y, w: rect.width, h: rect.height,
-          rectArea, fillRatio: area / rectArea,
-          aspect: rect.height > 0 ? rect.width / rect.height : 0,
-        });
-        coveredParents.add(parent);
+        const fillRatio = area / rectArea;
+        const aspect = rect.height > 0 ? rect.width / rect.height : 0;
+        const accepted = rect.width >= minDim && rect.height >= minDim &&
+          fillRatio >= FILL_MIN && aspect >= ASPECT_LO && aspect <= ASPECT_HI;
+        if (accepted) {
+          pipeline.afterMinSize++;
+          pass1.push({ x: rect.x, y: rect.y, w: rect.width, h: rect.height, rectArea, fillRatio, aspect });
+        } else {
+          leftover.push({ x: rect.x, y: rect.y, w: rect.width, h: rect.height, area });
+        }
       }
     }
     cnt.delete();
@@ -282,13 +288,41 @@ function findCells(canvas, minSizeFrac) {
   const pass1Areas = pass1.map((c) => c.rectArea).sort((a, b) => a - b);
   const medianArea = pass1Areas.length > 0 ? pass1Areas[Math.floor(pass1Areas.length / 2)] : 0;
 
-  // Fragment merge: only for parents none of whose children individually
-  // qualified — i.e. every fragment there is undersized, consistent with
-  // one cell's hole having been sliced up, not a fused mesh of real boxes
-  // (those already have legitimately cell-sized individual holes above).
+  // Fragment merge: a mark that touches a box's border at several points
+  // (e.g. an X reaching corner to corner) can slice its hole into several
+  // undersized pieces, each failing pass1 alone. Group leftover fragments
+  // by actual spatial adjacency (bounding boxes touching/overlapping
+  // within a tight tolerance) rather than by findContours' own parent
+  // index — a shared parent isn't reliable evidence of belonging to the
+  // same cell (it can silently span into neighboring structure), but two
+  // fragments whose boxes are only ~1px apart are almost certainly pieces
+  // of the same broken stroke. The tolerance is far smaller than the real
+  // gap between adjacent boxes, so this never bridges two different cells.
+  const gapTol = 1;
+  const n = leftover.length;
+  const parentIdx = new Array(n);
+  for (let i = 0; i < n; i++) parentIdx[i] = i;
+  const find = (a) => { while (parentIdx[a] !== a) { parentIdx[a] = parentIdx[parentIdx[a]]; a = parentIdx[a]; } return a; };
+  const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parentIdx[ra] = rb; };
+  const touches = (f1, f2) =>
+    !(f1.x - gapTol > f2.x + f2.w || f2.x - gapTol > f1.x + f1.w ||
+      f1.y - gapTol > f2.y + f2.h || f2.y - gapTol > f1.y + f1.h);
+  for (let i = 0; i < n; i++) {
+    for (let j = i + 1; j < n; j++) {
+      if (touches(leftover[i], leftover[j])) union(i, j);
+    }
+  }
+  const clusters = new Map();
+  for (let i = 0; i < n; i++) {
+    const root = find(i);
+    if (!clusters.has(root)) clusters.set(root, []);
+    clusters.get(root).push(leftover[i]);
+  }
+
+  const FRAG_FILL_MIN = 0.3;
   const pass2 = [];
-  for (const [parent, kids] of byParent) {
-    if (coveredParents.has(parent)) continue;
+  for (const kids of clusters.values()) {
+    if (kids.length < 2) continue; // a lone low-fill fragment is more likely a digit than a sliced box
     const x0 = Math.min(...kids.map((k) => k.x));
     const y0 = Math.min(...kids.map((k) => k.y));
     const x1 = Math.max(...kids.map((k) => k.x + k.w));
@@ -296,11 +330,11 @@ function findCells(canvas, minSizeFrac) {
     const w = x1 - x0, h = y1 - y0;
     const rectArea = w * h;
     const totalArea = kids.reduce((s, k) => s + k.area, 0);
-    pass2.push({
-      x: x0, y: y0, w, h, rectArea,
-      fillRatio: rectArea > 0 ? totalArea / rectArea : 0,
-      aspect: h > 0 ? w / h : 0,
-    });
+    const fillRatio = rectArea > 0 ? totalArea / rectArea : 0;
+    const aspect = h > 0 ? w / h : 0;
+    if (w >= minDim && h >= minDim && fillRatio >= FRAG_FILL_MIN && aspect >= ASPECT_LO && aspect <= ASPECT_HI) {
+      pass2.push({ x: x0, y: y0, w, h, rectArea, fillRatio, aspect });
+    }
   }
   pipeline.mergedFragments = pass2.length;
 
@@ -309,10 +343,7 @@ function findCells(canvas, minSizeFrac) {
   if (candidates.length > 0 && medianArea > 0) {
     cells = candidates.filter((c) =>
       c.rectArea >= 0.4 * medianArea &&
-      c.rectArea <= 2.2 * medianArea &&
-      c.aspect >= 0.5 &&
-      c.aspect <= 2.0 &&
-      c.fillRatio >= 0.3
+      c.rectArea <= 2.2 * medianArea
     );
   }
   pipeline.afterShapeFilter = cells.length;
