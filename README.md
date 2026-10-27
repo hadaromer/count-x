@@ -4,7 +4,7 @@ Upload a photo of a grid of boxes (like a bingo card, attendance sheet, or
 survey form) and count how many are marked with an X. Runs entirely in your
 browser — nothing gets uploaded anywhere.
 
-**Live site:** https://hadaromer.github.io/count-x/
+**Live site:** https://hadaromer.github.io/count-x/ · **עברית:** https://hadaromer.github.io/count-x/he.html
 
 ## How to use it
 
@@ -31,7 +31,7 @@ it.
 
 No server, no accounts, no file uploads — it's a static page.
 
-The default **Grid scan** works the way bubble-sheet / OMR scanners do (see
+**Grid scan** works the way bubble-sheet / OMR scanners do (see
 e.g. [OMRChecker](https://github.com/Udayraj123/OMRChecker)): it doesn't try
 to recognise each box by its own shape — that's exactly what a mark ruins —
 it finds the lattice the boxes sit on and measures the ink at every position
@@ -66,15 +66,7 @@ above a block can fake an outline, but never has two real boxes beside it).
 Lattices far smaller than the main blocks are dropped as text.
 
 Cells drawn with dashed outlines were placed from the grid rather than seen
-directly. If no usable grid is found, it falls back to the older method and
-says so.
-
-Two older methods are still in the dropdown for comparison. **Box ink**
-classifies each connected blob that looks box-sized by how much of its
-bounding box is inked; **X-shape matching** looks for crossing diagonal
-strokes (Hough lines) plus green blobs. On a realistic synthetic form
-(perspective, shadow, printed numbers, hand-drawn X's) they found 285 and
-120 of 800 boxes versus 800 for the grid scan.
+directly. If no usable grid is found it says so rather than guessing.
 
 ### Testing
 
@@ -103,3 +95,11 @@ Then open `http://localhost:8080`.
 
 Pushed to `main` on GitHub with Pages enabled on the repo root — see repo
 Settings → Pages. Any push to `main` goes live within a minute or two.
+
+## Hebrew version
+
+`he.html` (+ `he.css`) is a right-to-left Hebrew page for counting votes in
+elections, with a plain-language explanation of how it works and how to spot
+and remove wrong detections. It runs the same `omr.js` / `app.js`; the page
+sets `window.COUNTX_LANG = "he"` before `app.js` loads, which switches the
+status messages and notes to Hebrew.

@@ -137,3 +137,5 @@ footer {
 }
 
 #viewCanvas { touch-action: manipulation; cursor: pointer; }
+
+[hidden] { display: none !important; }

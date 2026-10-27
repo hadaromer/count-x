@@ -8,6 +8,7 @@
 </head>
 <body>
   <header>
+    <p style="margin:0 0 .5rem;font-size:.85rem"><a href="he.html" lang="he" dir="rtl">עברית</a></p>
     <h1>Count X</h1>
     <p class="subtitle">Upload a photo of a grid of boxes. It finds every box and counts the ones with an X automatically — no setup.</p>
   </header>
@@ -30,18 +31,6 @@
           <input type="number" id="expectedTotal" min="1" step="1" placeholder="e.g. 800" style="width:5.5rem" />
         </label>
         <span class="hint">Optional — shown next to the result so you can sanity-check the count, doesn't change detection.</span>
-      </div>
-
-      <div class="controls-row">
-        <label class="threshold-label">
-          Detection method
-          <select id="methodSelect">
-            <option value="grid">Grid scan (default)</option>
-            <option value="blob">Box ink (older)</option>
-            <option value="xshape">X-shape matching (experimental)</option>
-          </select>
-        </label>
-        <span class="hint" id="methodHint">Works like a bubble-sheet scanner: finds the grid the boxes sit on, then measures the ink inside every grid position — even boxes whose outline an X has damaged.</span>
       </div>
 
       <div class="canvas-wrap" id="canvasWrap" hidden>
