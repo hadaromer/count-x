@@ -4,7 +4,7 @@ Upload a photo of a grid of boxes (like a bingo card, attendance sheet, or
 survey form) and count how many are marked with an X. Runs entirely in your
 browser — nothing gets uploaded anywhere.
 
-**Live site:** https://hadaromer.github.io/count-x/ · **עברית:** https://hadaromer.github.io/count-x/he.html
+**Live site (Hebrew):** https://hadaromer.github.io/count-x/ · **English:** https://hadaromer.github.io/count-x/en.html
 
 ## How to use it
 
@@ -98,8 +98,9 @@ Settings → Pages. Any push to `main` goes live within a minute or two.
 
 ## Hebrew version
 
-`he.html` (+ `he.css`) is a right-to-left Hebrew page for counting votes in
+`index.html` (+ `he.css`) is the main page: a right-to-left Hebrew page for counting votes in
 elections, with a plain-language explanation of how it works and how to spot
 and remove wrong detections. It runs the same `omr.js` / `app.js`; the page
 sets `window.COUNTX_LANG = "he"` before `app.js` loads, which switches the
-status messages and notes to Hebrew.
+status messages and notes to Hebrew. The English version is `en.html`
+(`he.html` just redirects to the main page).

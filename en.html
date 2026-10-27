@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Count X</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <p style="margin:0 0 .5rem;font-size:.85rem"><a href="index.html" lang="he" dir="rtl">עברית</a></p>
+    <h1>Count X</h1>
+    <p class="subtitle">Upload a photo of a grid of boxes. It finds every box and counts the ones with an X automatically — no setup.</p>
+  </header>
+
+  <main>
+    <section class="panel">
+      <div id="status" class="status">Loading OpenCV&hellip;</div>
+
+      <div class="controls-row">
+        <label class="file-label">
+          <input type="file" id="fileInput" accept="image/*" />
+          <span>Choose photo</span>
+        </label>
+        <button id="resetBtn" class="btn btn-ghost" disabled>Reset</button>
+      </div>
+
+      <div class="controls-row">
+        <label class="threshold-label">
+          Total boxes, if you know it (optional)
+          <input type="number" id="expectedTotal" min="1" step="1" placeholder="e.g. 800" style="width:5.5rem" />
+        </label>
+        <span class="hint">Optional — shown next to the result so you can sanity-check the count, doesn't change detection.</span>
+      </div>
+
+      <div class="canvas-wrap" id="canvasWrap" hidden>
+        <canvas id="viewCanvas"></canvas>
+      </div>
+
+      <div id="resultsSection" hidden>
+        <div class="controls-row">
+          <label class="threshold-label">
+            Adjust sensitivity (auto-calibrated per photo)
+            <input type="range" id="thresholdSlider" min="-15" max="15" value="0" />
+            <span id="thresholdValue">auto</span>
+          </label>
+        </div>
+        <div id="totalResult" class="total-result"></div>
+        <p id="detectedNote" class="hint"></p>
+        <p class="hint">Tap a box on the photo to flip it between marked and blank. Tap empty space to add a mark the scan missed.</p>
+        <div class="controls-row"><button id="clearEditsBtn" class="btn btn-ghost" hidden>Clear my edits</button></div>
+
+        <div class="controls-row">
+          <button id="copyDiagnosticsBtn" class="btn btn-ghost">Copy diagnostic data</button>
+          <button id="showMaskBtn" class="btn btn-ghost">Show detection mask</button>
+          <span id="diagnosticsStatus" class="hint"></span>
+        </div>
+        <p class="hint">If the count looks wrong, tap this and paste the result into chat — it's a text summary of what the detector found (sizes, darkness scores, where on the page), no image data.</p>
+        <textarea id="diagnosticsFallback" readonly hidden rows="10" style="width:100%; font-family:monospace; font-size:0.75rem;"></textarea>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <p>Runs entirely in your browser &mdash; nothing is uploaded anywhere.</p>
+  </footer>
+
+  <script>
+    // opencv.js looks for a pre-existing Module config; onRuntimeInitialized
+    // fires once the WASM is actually compiled and ready, unlike the script
+    // tag's own onload (which fires as soon as the JS wrapper downloads).
+    var Module = {
+      onRuntimeInitialized() {
+        window.dispatchEvent(new Event("opencv-ready"));
+      }
+    };
+  </script>
+  <script async src="https://docs.opencv.org/4.9.0/opencv.js"></script>
+  <script src="omr.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
