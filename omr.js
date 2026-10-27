@@ -23,7 +23,7 @@ const OMR = {};
 OMR.otsu1d = function (values, nbins = 128) {
   let vmin = Infinity, vmax = -Infinity;
   for (const v of values) { if (v < vmin) vmin = v; if (v > vmax) vmax = v; }
-  if (!(vmax > vmin)) return { thresh: vmin, sep: 0 };
+  if (!(vmax > vmin)) return { thresh: vmin, mid: vmin, sep: 0 };
   const hist = new Array(nbins).fill(0);
   const bw = (vmax - vmin) / nbins;
   for (const v of values) hist[Math.min(nbins - 1, Math.floor((v - vmin) / bw))]++;
@@ -41,7 +41,7 @@ OMR.otsu1d = function (values, nbins = 128) {
     const v = wB * wF * (mB - mF) ** 2;
     if (v > maxVar) { maxVar = v; bestBin = t; bestMB = mB; bestMF = mF; }
   }
-  return { thresh: vmin + (bestBin + 1) * bw, sep: (bestMF - bestMB) * bw };
+  return { thresh: vmin + (bestBin + 1) * bw, mid: vmin + ((bestMB + bestMF) / 2 + 0.5) * bw, sep: (bestMF - bestMB) * bw };
 };
 
 const median = (arr) => {
@@ -60,59 +60,90 @@ OMR.analyze = function (cv, src, opts = {}) {
   // 1. lighting normalization -------------------------------------------------
   const gray = new cv.Mat();
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-  const bgClosed = new cv.Mat();
-  const k = Math.max(15, Math.round(minSide * 0.02) | 1);
-  const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(k, k));
-  cv.morphologyEx(gray, bgClosed, cv.MORPH_CLOSE, kernel);
-  const bg = new cv.Mat();
-  const sig = Math.max(8, minSide * 0.02);
-  cv.GaussianBlur(bgClosed, bg, new cv.Size(0, 0), sig);
-  const norm = new cv.Mat();
-  cv.divide(gray, bg, norm, 255, cv.CV_8U);
-  kernel.delete(); bgClosed.delete();
+  let bg = null, norm = null, blurred = null, binary = null, bin = null;
+  let paperLevel = 255, inkCut = 0, normK = 0, holes = [];
+  const minDim = 0.006 * minSide, maxDim = 0.3 * minSide;
 
-  const blurred = new cv.Mat();
-  cv.GaussianBlur(norm, blurred, new cv.Size(3, 3), 0);
-  // Thin printed outlines are faint after blur/JPEG; Otsu is dominated by dark
-  // marks and backgrounds and misses them. After normalization "paper" is a
-  // known level, so cut just below it: anything noticeably darker is ink.
-  const levelHist = new Array(256).fill(0);
-  for (let i = 0; i < blurred.data.length; i++) levelHist[blurred.data[i]]++;
-  let acc = 0, paperLevel = 255;
-  for (let v = 0; v < 256; v++) { acc += levelHist[v]; if (acc >= blurred.data.length / 2) { paperLevel = v; break; } }
-  const inkCut = Math.round(paperLevel * 0.94);
-  const binary = new cv.Mat();
-  cv.threshold(blurred, binary, inkCut, 255, cv.THRESH_BINARY_INV);
-  pipeline.paperLevel = paperLevel;
-  const bin = binary.data; // 255 = ink/border
+  // Normalize lighting with a closing of size k (removes dark features smaller
+  // than k, leaving the paper brightness), then find the square-ish holes.
+  // k must exceed the box size, or big filled boxes get "normalized away".
+  const prepare = (k) => {
+    if (bg) { bg.delete(); norm.delete(); blurred.delete(); binary.delete(); }
+    normK = k;
+    // estimate at reduced size so a big k stays cheap
+    const f = Math.max(1, Math.floor(k / 20));
+    let small = gray;
+    if (f > 1) { small = new cv.Mat(); cv.resize(gray, small, new cv.Size(Math.round(W / f), Math.round(H / f)), 0, 0, cv.INTER_AREA); }
+    const kk = Math.max(3, Math.round(k / f) | 1);
+    const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(kk, kk));
+    const closed = new cv.Mat();
+    cv.morphologyEx(small, closed, cv.MORPH_CLOSE, kernel);
+    const smooth = new cv.Mat();
+    cv.GaussianBlur(closed, smooth, new cv.Size(0, 0), Math.max(8, minSide * 0.02) / f);
+    bg = new cv.Mat();
+    if (f > 1) cv.resize(smooth, bg, new cv.Size(W, H), 0, 0, cv.INTER_LINEAR); else smooth.copyTo(bg);
+    kernel.delete(); closed.delete(); smooth.delete(); if (small !== gray) small.delete();
+    norm = new cv.Mat();
+    cv.divide(gray, bg, norm, 255, cv.CV_8U);
 
-  // 2. anchors: clean closed squares ------------------------------------------
-  const contours = new cv.MatVector();
-  const hierarchy = new cv.Mat();
-  cv.findContours(binary, contours, hierarchy, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE);
-  const minDim = 0.006 * minSide, maxDim = 0.05 * minSide;
-  let holes = [];
-  for (let i = 0; i < contours.size(); i++) {
-    const cnt = contours.get(i);
-    if (hierarchy.data32S[i * 4 + 3] !== -1) {
-      const r = cv.boundingRect(cnt);
-      if (r.width >= minDim && r.width <= maxDim && r.height >= minDim && r.height <= maxDim) {
-        const ra = r.width * r.height;
-        const fill = cv.contourArea(cnt) / ra;
-        const asp = r.width / r.height;
-        if (fill >= 0.6 && asp >= 0.75 && asp <= 1.34) holes.push({ x: r.x, y: r.y, w: r.width, h: r.height, area: ra });
+    blurred = new cv.Mat();
+    cv.GaussianBlur(norm, blurred, new cv.Size(3, 3), 0);
+    // Thin printed outlines are faint after blur/JPEG; Otsu is dominated by dark
+    // marks and backgrounds and misses them. After normalization "paper" is a
+    // known level, so cut just below it: anything noticeably darker is ink.
+    const levelHist = new Array(256).fill(0);
+    for (let i = 0; i < blurred.data.length; i++) levelHist[blurred.data[i]]++;
+    let acc = 0;
+    paperLevel = 255;
+    for (let v = 0; v < 256; v++) { acc += levelHist[v]; if (acc >= blurred.data.length / 2) { paperLevel = v; break; } }
+    inkCut = Math.round(paperLevel * 0.94);
+    binary = new cv.Mat();
+    cv.threshold(blurred, binary, inkCut, 255, cv.THRESH_BINARY_INV);
+    bin = binary.data; // 255 = ink/border
+
+    // 2. anchors: clean closed squares --------------------------------------
+    const contours = new cv.MatVector();
+    const hierarchy = new cv.Mat();
+    cv.findContours(binary, contours, hierarchy, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE);
+    holes = [];
+    for (let i = 0; i < contours.size(); i++) {
+      const cnt = contours.get(i);
+      if (hierarchy.data32S[i * 4 + 3] !== -1) {
+        const r = cv.boundingRect(cnt);
+        if (r.width >= minDim && r.width <= maxDim && r.height >= minDim && r.height <= maxDim) {
+          const ra = r.width * r.height;
+          const fill = cv.contourArea(cnt) / ra;
+          const asp = r.width / r.height;
+          if (fill >= 0.6 && asp >= 0.75 && asp <= 1.34) holes.push({ x: r.x, y: r.y, w: r.width, h: r.height, area: ra });
+        }
       }
+      cnt.delete();
     }
-    cnt.delete();
-  }
-  contours.delete(); hierarchy.delete();
+    contours.delete(); hierarchy.delete();
+  };
 
-  // typical box size = mode of hole widths (labels/digits are smaller and less uniform)
-  const hist = new Map();
-  for (const h of holes) { const b = Math.round(h.w / 2) * 2; hist.set(b, (hist.get(b) || 0) + 1); }
-  let modeW = 0, modeN = 0;
-  for (const [b, n] of hist) if (n > modeN) { modeN = n; modeW = b; }
+  // Typical box size: the densest cluster of hole widths (boxes are far more
+  // uniform than printed labels). Relative buckets so it works for any size.
+  const modeOf = () => {
+    const cnt = new Map();
+    for (const h of holes) { const b = Math.round(Math.log(h.w) / Math.log(1.07)); cnt.set(b, (cnt.get(b) || 0) + 1); }
+    let bestB = null, bestN = 0;
+    for (const b of cnt.keys()) {
+      const n = (cnt.get(b - 1) || 0) + cnt.get(b) + (cnt.get(b + 1) || 0);
+      if (n > bestN) { bestN = n; bestB = b; }
+    }
+    if (bestB === null) return 0;
+    return median(holes.filter((h) => Math.abs(Math.round(Math.log(h.w) / Math.log(1.07)) - bestB) <= 1).map((h) => h.w));
+  };
+
+  prepare(Math.max(15, Math.round(minSide * 0.02) | 1));
+  let modeW = modeOf();
+  if (modeW && modeW * 1.6 > normK) { prepare(Math.round(modeW * 2) | 1); modeW = modeOf(); }
+  pipeline.paperLevel = paperLevel;
+  pipeline.normKernel = normK;
   if (!modeW) { cleanup(); return { cells: [], cellThresh: 0.5, pipeline, maskMat: null }; }
+  // Big squares can't be mistaken for text, so small grids are believable.
+  const bigBox = modeW >= 0.03 * minSide;
   holes = holes.filter((h) => h.w >= 0.75 * modeW && h.w <= 1.3 * modeW && h.h >= 0.75 * modeW && h.h <= 1.3 * modeW);
   // dedupe holes that are the same box
   holes.sort((a, b) => b.area - a.area);
@@ -125,7 +156,7 @@ OMR.analyze = function (cv, src, opts = {}) {
   }
   pipeline.anchors = anchors.length;
   pipeline.boxSize = modeW;
-  if (anchors.length < 6) { cleanup(); return { cells: [], cellThresh: 0.5, pipeline, maskMat: null }; }
+  if (anchors.length < (bigBox ? 4 : 6)) { cleanup(); return { cells: [], cellThresh: 0.5, pipeline, maskMat: null }; }
 
   // 3a. grid orientation + pitch from anchor-to-anchor vectors ------------------
   const nn = [];
@@ -159,7 +190,8 @@ OMR.analyze = function (cv, src, opts = {}) {
   const U0 = [ux * pitchU, uy * pitchU], V0 = [vx * pitchV, vy * pitchV];
 
   // 3b. does a box outline exist at (cx,cy)? refine position within +-3px ----------
-  const half = modeW / 2 + 1.5;
+  const half = modeW / 2 + Math.max(1.5, modeW * 0.03);
+  const tol = Math.max(2, Math.round(modeW * 0.06));
   const sideScore = (cx, cy) => {
     const sides = [0, 0, 0, 0];
     const n = Math.max(4, Math.round(modeW) - 3);
@@ -173,7 +205,7 @@ OMR.analyze = function (cv, src, opts = {}) {
         else if (s === 2) { px = cx - half; py = cy + t; nx = 1; ny = 0; }
         else { px = cx + half; py = cy + t; nx = 1; ny = 0; }
         let hit = false;
-        for (let o = -2; o <= 2 && !hit; o++) {
+        for (let o = -tol; o <= tol && !hit; o++) {
           const xx = Math.round(px + nx * o), yy = Math.round(py + ny * o);
           if (xx >= 0 && xx < W && yy >= 0 && yy < H && bin[yy * W + xx]) hit = true;
         }
@@ -252,7 +284,7 @@ OMR.analyze = function (cv, src, opts = {}) {
           if (dir[0] !== 0) e.lu = obs; else e.lv = obs;
           members.push(e); queue.push(e);
         } else if (virtualCount < maxVirtual) {
-          const ok = validate(px, py, 3);
+          const ok = validate(px, py, Math.max(3, Math.round(modeW * 0.1)));
           if (!ok) continue;
           if (nearest(ok.cx, ok.cy, modeW * 0.6)) continue;
           const e2 = { cx: ok.cx, cy: ok.cy, virtual: true, comp, i: c.i + dir[0], j: c.j + dir[1], lu: c.lu.slice(), lv: c.lv.slice() };
@@ -287,11 +319,22 @@ OMR.analyze = function (cv, src, opts = {}) {
     const real = members.filter((c) => !c.virtual);
     for (const v of members) {
       if (!v.virtual) continue;
-      const pts = real.filter((a) => Math.abs(a.i - v.i) <= 3 && Math.abs(a.j - v.j) <= 3);
-      const f = pts.length >= 6 ? fitAffine(pts) : null;
+      // Fit from the closest real anchors: widen the window only until there are
+      // enough, since a wide window averages in perspective curvature.
+      const need = bigBox ? 3 : 6;
+      let pts = [], f = null;
+      for (const win of [1, 2, 3]) {
+        pts = real.filter((a) => Math.abs(a.i - v.i) <= win && Math.abs(a.j - v.j) <= win);
+        if (pts.length >= need) { f = fitAffine(pts); if (f) break; }
+      }
       if (!f) { v.dead = true; if (dbg) dbg.push({ why: 'fit', x: v.cx, y: v.cy, n: pts.length }); continue; }
+      // the fit must agree with the anchors it was made from
+      if (pts.length > 3) {
+        const resid = pts.map((a) => Math.hypot(f.x[0] + f.x[1] * a.i + f.x[2] * a.j - a.cx, f.y[0] + f.y[1] * a.i + f.y[2] * a.j - a.cy));
+        if (median(resid) > 0.18 * modeW) { v.dead = true; if (dbg) dbg.push({ why: 'fitres', x: v.cx, y: v.cy }); continue; }
+      }
       const px = f.x[0] + f.x[1] * v.i + f.x[2] * v.j, py = f.y[0] + f.y[1] * v.i + f.y[2] * v.j;
-      const ok = validate(px, py, 2, true);
+      const ok = validate(px, py, Math.max(2, Math.round(modeW * 0.06)), true);
       if (!ok) { v.dead = true; if (dbg) dbg.push({ why: 'ringB', x: px, y: py }); continue; }
       v.cx = ok.cx; v.cy = ok.cy;
       v.lu = [f.x[1], f.y[1]]; v.lv = [f.x[2], f.y[2]];
@@ -338,7 +381,7 @@ OMR.analyze = function (cv, src, opts = {}) {
   for (const c of cellsAll) if (c.virtual && !confirmed.has(c) && !c.dead) { c.dead = true; if (dbg) dbg.push({ why: 'unconfirmed', x: c.cx, y: c.cy }); }
   if (dbg) pipeline.dbg = dbg;
   for (const c of cellsAll) if (c.dead) c.comp = -2;
-  const MIN_COMP = 12;
+  const MIN_COMP = bigBox ? 4 : 12;
   const keep = new Set();
   let nComps = 0;
   // Real blocks are all about the same size, so a lattice far smaller than the
@@ -361,12 +404,25 @@ OMR.analyze = function (cv, src, opts = {}) {
   for (const c of cells) {
     const x0 = Math.round(c.cx - rIn), x1 = Math.round(c.cx + rIn);
     const y0 = Math.round(c.cy - rIn), y1 = Math.round(c.cy + rIn);
+    // Paper level right around this box (upper quartile of a ring just outside
+    // its outline), so a shadow the lighting correction missed doesn't read as ink.
+    const ringIn = Math.round(modeW / 2 + Math.max(3, modeW * 0.08)), ringOut = ringIn + Math.max(3, Math.round(modeW * 0.12));
+    const ringVals = [];
+    for (let y = Math.max(0, Math.round(c.cy - ringOut)); y <= Math.min(H - 1, Math.round(c.cy + ringOut)); y++) {
+      for (let x = Math.max(0, Math.round(c.cx - ringOut)); x <= Math.min(W - 1, Math.round(c.cx + ringOut)); x++) {
+        const m = Math.max(Math.abs(x - c.cx), Math.abs(y - c.cy));
+        if (m >= ringIn && m <= ringOut) ringVals.push(nd[y * W + x]);
+      }
+    }
+    ringVals.sort((a, b) => a - b);
+    const localPaper = ringVals.length ? ringVals[Math.floor(ringVals.length * 0.75)] : paperLevel;
+    const cut = Math.round(localPaper * 0.9);
     let n = 0, dark = 0, gsum = 0, lsum = 0;
     for (let y = Math.max(0, y0); y <= Math.min(H - 1, y1); y++) {
       for (let x = Math.max(0, x0); x <= Math.min(W - 1, x1); x++) {
         const v = nd[y * W + x];
         n++; lsum += v;
-        if (v < inkCut) dark += inkCut - v; // ink "mass": how far below paper, not just whether
+        if (v < cut) dark += cut - v; // ink "mass": how far below local paper, not just whether
         const p = (y * W + x) * 4;
         const lum = Math.max(40, bg.data[y * W + x]);
         gsum += ((sd[p + 1] - (sd[p] + sd[p + 2]) / 2) / lum) * 255;
@@ -380,7 +436,7 @@ OMR.analyze = function (cv, src, opts = {}) {
   // paper tint differs per photo: green is measured relative to the typical cell
   const greenBase = median(cells.map((c) => c.greenRaw));
   for (const c of cells) {
-    c.ink = Math.min(1, c.inkFrac / 12);
+    c.ink = Math.min(1, c.inkFrac / 10);
     c.green = Math.max(0, Math.min(1, (c.greenRaw - greenBase) / 22));
     c.score = Math.max(c.ink, c.green);
   }
@@ -391,9 +447,9 @@ OMR.analyze = function (cv, src, opts = {}) {
     if (o.sep > 0.25) {
       // Otsu lands midway between blank and *strong* marks and would lose faint
       // ones. Blank cells cluster tightly near zero, so cut just above them.
-      const blank = cells.map((c) => c.score).filter((v) => v < o.thresh).sort((a, b) => a - b);
+      const blank = cells.map((c) => c.score).filter((v) => v < o.mid).sort((a, b) => a - b);
       const p98 = blank.length ? blank[Math.min(blank.length - 1, Math.floor(blank.length * 0.98))] : 0;
-      cellThresh = Math.min(o.thresh, Math.max(0.2, p98 * 1.4));
+      cellThresh = Math.min(o.mid, Math.max(0.2, p98 * 1.4));
     }
   }
 

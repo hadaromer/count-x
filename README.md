@@ -68,6 +68,16 @@ Lattices far smaller than the main blocks are dropped as text.
 Cells drawn with dashed outlines were placed from the grid rather than seen
 directly. If no usable grid is found it says so rather than guessing.
 
+### Box size
+
+Everything scales with the box size found in the photo: the hole-size limits, the
+lighting-correction kernel (it must be larger than the boxes, or big green-filled
+boxes get normalized away — it's estimated at reduced size so it stays fast), the
+outline-search tolerances, and the minimum grid size (big squares can't be
+mistaken for text, so small grids are accepted). Tested from ~16px boxes up to
+~110px (40 boxes, half marked) with exact results; grids of only 4–9 huge
+boxes can still lose marked cells.
+
 ### Testing
 
 `omr.js` has no DOM dependency, so it's tested against the real OpenCV.js
