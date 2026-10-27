@@ -477,12 +477,14 @@ function renderResult(expectedTotal) {
 
   state.viewCtx.drawImage(state.workCanvas, 0, 0);
 
-  const effectiveThresh = state.cellThresh + state.adjust;
-  let count = 0;
+  let count = 0, edited = 0;
   for (const c of state.cells) {
-    const marked = c.score >= effectiveThresh;
+    const marked = isMarked(c);
     if (marked) count++;
-    state.viewCtx.strokeStyle = marked ? "#16a34a" : "rgba(37,99,235,0.35)";
+    if (c.override !== undefined || c.manual) edited++;
+    state.viewCtx.strokeStyle = (c.override !== undefined || c.manual)
+      ? "#f59e0b"
+      : marked ? "#16a34a" : "rgba(37,99,235,0.35)";
     state.viewCtx.lineWidth = marked ? 3 : 1.5;
     state.viewCtx.setLineDash(c.virtual ? [4, 3] : []);
     state.viewCtx.strokeRect(c.x + 1, c.y + 1, c.w - 2, c.h - 2);
@@ -502,8 +504,56 @@ function renderResult(expectedTotal) {
       note += ` (You said ${expectedTotal} total — found ${against}, off by ${Math.abs(against - expectedTotal)}.)`;
     }
   }
+  if (edited) note += ` ${edited} edited by hand (orange).`;
   el("detectedNote").textContent = note;
+  el("clearEditsBtn").hidden = edited === 0;
 }
+
+// A box counts as marked by the scan unless the user has flipped it.
+function isMarked(c) {
+  if (c.override !== undefined) return c.override;
+  return c.score >= state.cellThresh + state.adjust;
+}
+
+// Tap a box to flip it; tap empty space to add a mark the scan missed.
+// Tapping a hand-added mark removes it.
+el("viewCanvas").addEventListener("click", (e) => {
+  if (!state.cells || state.showingMask) return;
+  const canvas = state.viewCanvas;
+  const rect = canvas.getBoundingClientRect();
+  const px = ((e.clientX - rect.left) / rect.width) * canvas.width;
+  const py = ((e.clientY - rect.top) / rect.height) * canvas.height;
+
+  let hit = null, best = Infinity;
+  for (const c of state.cells) {
+    const slack = 3;
+    if (px >= c.x - slack && px <= c.x + c.w + slack && py >= c.y - slack && py <= c.y + c.h + slack) {
+      const d = Math.hypot(px - (c.x + c.w / 2), py - (c.y + c.h / 2));
+      if (d < best) { best = d; hit = c; }
+    }
+  }
+  if (hit) {
+    if (hit.manual) {
+      state.cells.splice(state.cells.indexOf(hit), 1);
+    } else {
+      hit.override = !isMarked(hit);
+      // flipping back to what the scan said is no longer an edit
+      if (hit.override === (hit.score >= state.cellThresh + state.adjust)) delete hit.override;
+    }
+  } else {
+    const sizes = state.cells.map((c) => c.w).sort((p, q) => p - q);
+    const s = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 18;
+    state.cells.push({ x: Math.round(px - s / 2), y: Math.round(py - s / 2), w: s, h: s, score: 1, manual: true, override: true });
+  }
+  renderResult(state.expectedTotal);
+});
+
+el("clearEditsBtn").addEventListener("click", () => {
+  if (!state.cells) return;
+  state.cells = state.cells.filter((c) => !c.manual);
+  for (const c of state.cells) delete c.override;
+  renderResult(state.expectedTotal);
+});
 
 // ── Diagnostics ──────────────────────────────────────────────────────────────
 // Lets a user paste real data back to the developer when something's off,
@@ -547,7 +597,7 @@ function buildDiagnosticsText() {
       : c.fill === undefined
         ? `ink=${c.ink.toFixed(3)} green=${c.green.toFixed(3)} virtual=${!!c.virtual}`
         : `fill=${c.fill.toFixed(3)} green=${c.green.toFixed(3)}`;
-    return `  x=${c.x} y=${c.y} w=${c.w} h=${c.h} ${extra} score=${c.score.toFixed(3)} marked=${c.score >= effectiveThresh}`;
+    return `  x=${c.x} y=${c.y} w=${c.w} h=${c.h} ${extra} score=${c.score.toFixed(3)} marked=${isMarked(c)}${c.override !== undefined ? " (edited)" : ""}${c.manual ? " (added)" : ""}`;
   });
 
   return [
@@ -557,14 +607,14 @@ function buildDiagnosticsText() {
     `Expected total given: ${state.expectedTotal ?? "(none)"}`,
     `Method: ${state.method}${state.fellBack ? " (grid found nothing, fell back to blob)" : ""}`,
     state.pipeline.anchors !== undefined
-      ? `Grid: anchors=${state.pipeline.anchors} virtual=${state.pipeline.virtual} components=${state.pipeline.components} cells=${state.pipeline.keptCells} boxSize=${state.pipeline.boxSize} paperLevel=${state.pipeline.paperLevel} rotation=${(state.pipeline.theta || 0).toFixed(1)}deg pitch=${(state.pipeline.pitchU || 0).toFixed(1)}x${(state.pipeline.pitchV || 0).toFixed(1)}`
+      ? `Grid: anchors=${state.pipeline.anchors} virtual=${state.pipeline.virtual} components=${state.pipeline.components} cells=${state.pipeline.keptCells} boxSize=${state.pipeline.boxSize} paperLevel=${state.pipeline.paperLevel} componentSizes=[${state.pipeline.compSizes}] rotation=${(state.pipeline.theta || 0).toFixed(1)}deg pitch=${(state.pipeline.pitchU || 0).toFixed(1)}x${(state.pipeline.pitchV || 0).toFixed(1)}`
       : state.method === "xshape"
         ? `Pipeline (last run): xCandidates=${state.pipeline.xCandidates} greenCandidates=${state.pipeline.greenCandidates} afterShapeFilter=${state.pipeline.afterShapeFilter}`
         : `Pipeline (last run): rawComponents=${state.pipeline.rawComponents} plausibleSized=${state.pipeline.plausibleSized} modeWidth=${state.pipeline.modeWidth} afterShapeFilter=${state.pipeline.afterShapeFilter}`,
     `Detected cells: ${cells.length}`,
     `Cell size: width min=${widths[0]} median=${med(widths)} max=${widths[widths.length - 1]} | height min=${heights[0]} median=${med(heights)} max=${heights[heights.length - 1]}`,
     `Classification threshold (auto + slider adjust): ${effectiveThresh.toFixed(3)} (auto=${state.cellThresh.toFixed(3)}, slider adjust=${state.adjust.toFixed(3)})`,
-    `Marked: ${cells.filter((c) => c.score >= effectiveThresh).length} / ${cells.length}`,
+    `Marked: ${cells.filter(isMarked).length} / ${cells.length} (hand edits: ${cells.filter((c) => c.override !== undefined || c.manual).length})`,
     ``,
     `Mark-score histogram (0=blank, 1=marked; score = max of ink and greenness):`,
     ...histLines,

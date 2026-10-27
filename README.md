@@ -18,6 +18,10 @@ browser — nothing gets uploaded anywhere.
    actual photo.
 4. If it's getting some wrong, drag the **sensitivity** slider — results
    update instantly, no reprocessing.
+5. Fix individual boxes by hand: **tap a box** on the photo to flip it
+   between marked and blank, or **tap empty space** to add a mark the scan
+   missed (tap an added mark to remove it). Edited boxes turn orange, the
+   count updates, and "Clear my edits" undoes them all.
 
 Make sure the whole grid is visible in the photo (not cropped at the edge)
 and reasonably well-lit — it needs to see every box's full border to find
@@ -55,6 +59,12 @@ on it. The pipeline (`omr.js`, runs identically in the browser and in Node):
    above that cluster (with 1-D Otsu to find it) — faint marks still count,
    and the sensitivity slider moves the cut.
 
+Printed titles, big digits and letters can't join the grid: a box has to sit
+on the lattice, and a position the scan couldn't see directly is only
+believed once two already-believed neighbours back it (a row of title text
+above a block can fake an outline, but never has two real boxes beside it).
+Lattices far smaller than the main blocks are dropped as text.
+
 Cells drawn with dashed outlines were placed from the grid rather than seen
 directly. If no usable grid is found, it falls back to the older method and
 says so.
@@ -72,8 +82,9 @@ strokes (Hough lines) plus green blobs. On a realistic synthetic form
 build in Node on synthetic forms with ground truth: 800 boxes in 8 blocks,
 numbers printed above each box, hand-jittered X's, translucent highlighter,
 random perspective, up to ~5° rotation, a diagonal shadow band, blur, noise
-and JPEG compression, plus lower-resolution, fainter-pen and denser variants.
-All come out at 800/800 positions with at most 2 mark errors. Known weak
+and JPEG compression, plus lower-resolution, fainter-pen and denser variants, and forms with big
+block titles ("700-601"), large margin digits, rows of 0/6/8/9 and circles.
+All come out at ~800/800 positions, zero spurious cells and at most 3 mark errors. Known weak
 spots: very tightly packed boxes (gap between boxes under ~8px) and layouts
 where printed numbers touch the neighbouring block's boxes.
 

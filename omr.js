@@ -54,6 +54,7 @@ const median = (arr) => {
 OMR.analyze = function (cv, src, opts = {}) {
   const W = src.cols, H = src.rows;
   const minSide = Math.min(W, H);
+  const dbg = opts.debug ? [] : null;
   const pipeline = { anchors: 0, virtual: 0, components: 0, keptCells: 0, boxSize: 0, theta: 0, pitchU: 0, pitchV: 0 };
 
   // 1. lighting normalization -------------------------------------------------
@@ -185,7 +186,7 @@ OMR.analyze = function (cv, src, opts = {}) {
   // Look for an outline within +-range px of (cx,cy); among near-equal best
   // placements prefer the one closest to where we expected it, so repeated
   // snapping can't walk toward nearby text.
-  const validate = (cx, cy, range) => {
+  const validate = (cx, cy, range, loose) => {
     const cand = [];
     for (let dy = -range; dy <= range; dy++) {
       for (let dx = -range; dx <= range; dx++) {
@@ -195,6 +196,13 @@ OMR.analyze = function (cv, src, opts = {}) {
     }
     const top = Math.max(...cand.map((c) => c.total));
     const best = cand.filter((c) => c.total >= top - 0.2).sort((p, q) => p.off - q.off)[0];
+    if (loose) {
+      // already placed by the lattice fit; just confirm there's some outline
+      // there (a thick X can hide much of it). Confirmation by neighbours
+      // below is what keeps fake cells out.
+      const some = best.sides.filter((v) => v >= 0.55).length;
+      return some >= 2 && best.total >= 2.2 ? best : null;
+    }
     const strong = best.sides.filter((v) => v >= 0.75).length;
     return strong >= 3 && best.total >= 3.2 ? best : null;
   };
@@ -234,7 +242,7 @@ OMR.analyze = function (cv, src, opts = {}) {
         const base = dir[0] !== 0 ? c.lu : c.lv;
         const sgn = dir[0] !== 0 ? dir[0] : dir[1];
         const px = c.cx + sgn * base[0], py = c.cy + sgn * base[1];
-        const r = 0.35 * Math.hypot(base[0], base[1]);
+        const r = 0.25 * Math.hypot(base[0], base[1]);
         const e = nearest(px, py, r);
         if (e) {
           if (e.comp !== -1) continue;
@@ -281,10 +289,10 @@ OMR.analyze = function (cv, src, opts = {}) {
       if (!v.virtual) continue;
       const pts = real.filter((a) => Math.abs(a.i - v.i) <= 3 && Math.abs(a.j - v.j) <= 3);
       const f = pts.length >= 6 ? fitAffine(pts) : null;
-      if (!f) { v.dead = true; continue; }
+      if (!f) { v.dead = true; if (dbg) dbg.push({ why: 'fit', x: v.cx, y: v.cy, n: pts.length }); continue; }
       const px = f.x[0] + f.x[1] * v.i + f.x[2] * v.j, py = f.y[0] + f.y[1] * v.i + f.y[2] * v.j;
-      const ok = validate(px, py, 2);
-      if (!ok) { v.dead = true; continue; }
+      const ok = validate(px, py, 2, true);
+      if (!ok) { v.dead = true; if (dbg) dbg.push({ why: 'ringB', x: px, y: py }); continue; }
       v.cx = ok.cx; v.cy = ok.cy;
       v.lu = [f.x[1], f.y[1]]; v.lv = [f.x[2], f.y[2]];
     }
@@ -298,35 +306,48 @@ OMR.analyze = function (cv, src, opts = {}) {
     }
   }
 
-  // A gap cell is only believable if the lattice continues on at least two
-  // sides of it (interpolated between real cells, or the corner of a block).
-  let pruned = true;
-  while (pruned) {
-    pruned = false;
-    const gridAlive = new Map();
-    for (const c of cellsAll) if (!c.dead) { const k2 = key(c.cx, c.cy); if (!gridAlive.has(k2)) gridAlive.set(k2, []); gridAlive.get(k2).push(c); }
-    const near = (px, py, r, self) => {
-      const gx = Math.floor(px / gs), gy = Math.floor(py / gs);
-      for (let ix = gx - 1; ix <= gx + 1; ix++) for (let iy = gy - 1; iy <= gy + 1; iy++) {
-        const lst = gridAlive.get(`${ix},${iy}`);
-        if (lst) for (const c of lst) if (c !== self && Math.hypot(c.cx - px, c.cy - py) < r) return true;
-      }
-      return false;
-    };
+  // A gap cell is believed only once two neighbours that are themselves
+  // believed (real anchors, or already-confirmed gap cells) back it up.
+  // Merely having neighbours isn't enough: a row of title text above a block
+  // can produce a whole row of mutually-supporting fake cells, but each has
+  // only one real box next to it, so none of them ever gets confirmed.
+  const confirmed = new Set(cellsAll.filter((c) => !c.virtual && !c.dead));
+  const gridConf = new Map();
+  const addConf = (c) => { const k2 = key(c.cx, c.cy); if (!gridConf.has(k2)) gridConf.set(k2, []); gridConf.get(k2).push(c); };
+  for (const c of confirmed) addConf(c);
+  const hasConf = (px, py, r) => {
+    const gx = Math.floor(px / gs), gy = Math.floor(py / gs);
+    for (let ix = gx - 1; ix <= gx + 1; ix++) for (let iy = gy - 1; iy <= gy + 1; iy++) {
+      const lst = gridConf.get(`${ix},${iy}`);
+      if (lst) for (const c of lst) if (Math.hypot(c.cx - px, c.cy - py) < r) return true;
+    }
+    return false;
+  };
+  let grew = true;
+  while (grew) {
+    grew = false;
     for (const c of cellsAll) {
-      if (!c.virtual || c.dead) continue;
+      if (!c.virtual || c.dead || confirmed.has(c)) continue;
       let sup = 0;
       for (const [vec, sg] of [[c.lu, 1], [c.lu, -1], [c.lv, 1], [c.lv, -1]]) {
-        if (near(c.cx + sg * vec[0], c.cy + sg * vec[1], 0.4 * Math.hypot(vec[0], vec[1]), c)) sup++;
+        if (hasConf(c.cx + sg * vec[0], c.cy + sg * vec[1], 0.35 * Math.hypot(vec[0], vec[1]))) sup++;
       }
-      if (sup < 2) { c.dead = true; pruned = true; }
+      if (sup >= 2) { confirmed.add(c); addConf(c); grew = true; }
     }
   }
+  for (const c of cellsAll) if (c.virtual && !confirmed.has(c) && !c.dead) { c.dead = true; if (dbg) dbg.push({ why: 'unconfirmed', x: c.cx, y: c.cy }); }
+  if (dbg) pipeline.dbg = dbg;
   for (const c of cellsAll) if (c.dead) c.comp = -2;
   const MIN_COMP = 12;
   const keep = new Set();
   let nComps = 0;
-  comps.forEach((m, i) => { if (m.filter((c) => !c.dead).length >= MIN_COMP) { keep.add(i); nComps++; } });
+  // Real blocks are all about the same size, so a lattice far smaller than the
+  // biggest one is almost certainly printed text, a barcode or a marker.
+  const compSizes = comps.map((m) => m.filter((c) => !c.dead).length);
+  const biggest = Math.max(0, ...compSizes);
+  const minKeep = Math.max(MIN_COMP, biggest >= 40 ? Math.round(biggest * 0.15) : 0);
+  compSizes.forEach((n, i) => { if (n >= minKeep) { keep.add(i); nComps++; } });
+  pipeline.compSizes = compSizes.filter((n) => n > 0).sort((a, b) => b - a).slice(0, 16).join(",");
   let cells = cellsAll.filter((c) => keep.has(c.comp));
   pipeline.components = nComps;
   pipeline.virtual = cells.filter((c) => c.virtual).length;
