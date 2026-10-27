@@ -31,7 +31,16 @@ photo you upload, it:
 
 1. Thresholds it to a binary foreground mask (ink and borders both count as
    "foreground," blank paper doesn't).
-2. Finds every closed shape in that mask as a contour
+2. Strips that mask down to thin strokes only, via `cv.distanceTransform`
+   (each foreground pixel's distance to the nearest background pixel —
+   low for a thin printed border or pen line, high for a solid interior
+   fill or thick ink). A marked box's own ink — a highlighter fill, or an
+   X whose diagonals touch the border at several points — otherwise
+   destroys or fragments that box's enclosed hole, which would make a
+   marked box invisible to hole-based detection rather than just
+   misclassified. Thinning first recovers the border, and its hole,
+   regardless of what's marked inside it.
+3. Finds every closed shape in the thinned mask as a contour
    (`cv.findContours`, via [OpenCV.js](https://docs.opencv.org/4.x/d5/d10/tutorial_js_root.html)),
    using `RETR_CCOMP` and keeping each box's enclosed interior (a "hole" in
    the border mesh) rather than its own outer ring. On a densely packed
@@ -41,33 +50,44 @@ photo you upload, it:
    undercounts. A box's hole stays correctly segmented even when the
    surrounding mesh is fully fused, so this holds up regardless of how
    tightly packed the boxes are.
-3. Keeps only the candidates big enough to plausibly be a box a person
+4. Handles boxes whose hole got sliced into several undersized fragments
+   (an X touching the border at multiple points): fragments sharing a
+   parent border whose *combined* footprint is cell-sized get merged into
+   one candidate — but only when none of that parent's fragments already
+   qualified alone, so a genuinely fused mesh of many separate blank boxes
+   (which legitimately share one parent) never gets merged into a single
+   giant box.
+5. Keeps only the candidates big enough to plausibly be a box a person
    could mark with a pen (a fixed minimum size relative to the photo) —
    printed reference numbers/labels often contain characters like 0, 8, 9,
    or 6 that have their own enclosed hole, identical in shape to a
    checkbox's; this is what tells them apart, since a label's internal
    counter is reliably much smaller than a real box, no matter how many of
-   them there are (which also makes a false positive only slightly more
-   likely to be filtered, not fundamentally fixed, by just excluding
-   outliers from the overall median). Among what's left: closeness to the
-   remaining pool's median size, a reasonable aspect ratio, and a high fill
-   ratio (contour area vs. its own bounding box — a hollow border rectangle
-   has that; a disconnected ink blob or a clipped fragment doesn't).
-4. For each box kept, crops an inset region (avoiding its own border) and
-   measures how dark it is on average.
-5. Finds the natural split between "blank" and "marked" scores via a
-   second, cell-level Otsu threshold over all the boxes' darkness scores
-   (not a fixed cutoff against pure white) — self-calibrates to whatever a
+   them there are. Among what's left: closeness to the remaining pool's
+   median size, a reasonable aspect ratio, and a fill ratio (contour area
+   vs. its own bounding box) high enough to confirm a real hole shape, not
+   a sliver fragment.
+6. For each box kept, crops an inset region (avoiding its own border) and
+   measures two independent signals: grayscale darkness (pen/pencil ink)
+   and "greenness" (how much the average color leans green — for
+   highlighter-style marks that are barely darker than blank paper and so
+   are invisible to a pure darkness score). A box's mark score is the
+   stronger of the two.
+7. Finds the natural split between "blank" and "marked" scores via a
+   second, cell-level Otsu threshold over all the boxes' mark scores (not
+   a fixed cutoff against pure white) — self-calibrates to whatever a
    blank box actually looks like in this specific photo (handles non-white
    cell fills, shadows, scan tint) and to whatever fraction of boxes are
    actually marked.
 
-This is a "how dark is it" measurement, not real OCR — it doesn't care
-whether the mark is an X, a checkmark, or a scribble, just whether there's
-visible ink in the box. Validated against synthetic ground-truth grids
-across varied pen widths, cell sizes, rotation, mark density from 5%-70%,
-non-white cell fills, zero-gap touching borders, and printed reference
-numbers with their own enclosed holes sitting next to every box.
+This is a "how dark/colored is it" measurement, not real OCR — it doesn't
+care whether the mark is an X, a checkmark, a scribble, or a highlighter
+fill, just whether there's visible ink or color in the box. Validated
+against synthetic ground-truth grids across varied pen widths, cell sizes,
+rotation, mark density from 5%-70%, non-white cell fills, zero-gap touching
+borders, printed reference numbers with their own enclosed holes sitting
+next to every box, and marks that fully fill or fragment a box's hole
+(highlighter fills, corner-touching X's).
 
 ## Running locally
 

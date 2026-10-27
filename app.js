@@ -174,6 +174,17 @@ function findCellsBestMatch(canvas, expectedTotal) {
 // by the border mesh even when the mesh itself is fully fused, so this is
 // robust either way.
 //
+// Before contour-finding, strip the mask down to thin strokes only, via
+// distanceTransform (each foreground pixel's distance to the nearest
+// background pixel — low for a thin printed border or pen line, high for
+// a solid interior fill or thick ink). A MARKED box's interior ink — a
+// highlighter fill, or an X whose diagonals touch the border at multiple
+// points — destroys that box's hole entirely or slices it into undersized
+// fragments; without this step, a marked box simply disappears from
+// detection rather than being misclassified. Stripping out everything but
+// thin strokes first recovers the border (and its hole) regardless of
+// what's marked inside it.
+//
 // A real form's printed reference numbers/labels (e.g. "0", "8", "9", "6")
 // have their own enclosed holes topologically identical to a checkbox's —
 // findContours can't tell a hollow digit apart from a hollow box by shape
@@ -188,7 +199,14 @@ function findCellsBestMatch(canvas, expectedTotal) {
 // Among the survivors, keep ones close in size to that filtered pool's
 // median (real cells cluster at one size), a reasonable aspect ratio, and a
 // fill ratio (contour area vs. its own bounding-box area) that confirms
-// it's a filled hole shape, not a sliver/fragment.
+// it's a filled hole shape, not a sliver/fragment. A second pass handles
+// boxes whose hole got sliced into several undersized fragments (an X
+// touching the border at multiple points): fragments that share a parent
+// border and whose *combined* footprint is cell-sized are merged into one
+// candidate — but only when none of that parent's fragments were already
+// cell-sized alone, so a genuinely fused mesh of many separate blank boxes
+// (which legitimately share one parent) is never merged into a single
+// giant box.
 //
 // Classification: per cell, measure two independent signals in an inset
 // crop — grayscale darkness (pen ink, pencil) and "greenness" (G channel
@@ -209,51 +227,92 @@ function findCells(canvas, minSizeFrac) {
   const binary = new cv.Mat();
   cv.threshold(blurred, binary, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
 
-  // Keep a viewable copy of the exact binary mask findContours runs on —
-  // lets a user screenshot what the algorithm actually sees and share that
-  // back, since there's no way to read a photo shared in chat directly.
+  const dist = new cv.Mat();
+  cv.distanceTransform(binary, dist, cv.DIST_L2, 3);
+  const thinRaw = new cv.Mat();
+  cv.threshold(dist, thinRaw, 2.2, 255, cv.THRESH_BINARY_INV);
+  const thin = new cv.Mat();
+  thinRaw.convertTo(thin, cv.CV_8U);
+  cv.bitwise_and(thin, binary, thin); // THRESH_BINARY_INV also marks background (dist=0) — restrict back to foreground
+  dist.delete(); thinRaw.delete();
+
+  // Keep a viewable copy of the exact mask findContours runs on — lets a
+  // user screenshot what the algorithm actually sees and share that back,
+  // since there's no way to read a photo shared in chat directly.
   const maskCanvas = document.createElement("canvas");
   maskCanvas.width = canvas.width;
   maskCanvas.height = canvas.height;
-  cv.imshow(maskCanvas, binary);
+  cv.imshow(maskCanvas, thin);
 
   const contours = new cv.MatVector();
   const hierarchy = new cv.Mat();
-  cv.findContours(binary, contours, hierarchy, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE);
+  cv.findContours(thin, contours, hierarchy, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE);
 
   const minDim = minSizeFrac * Math.min(canvas.width, canvas.height);
-  const pipeline = { rawContours: contours.size(), holeContours: 0, afterMinSize: 0, afterShapeFilter: 0 };
-  const candidates = [];
+  const pipeline = { rawContours: contours.size(), holeContours: 0, afterMinSize: 0, mergedFragments: 0, afterShapeFilter: 0 };
+
+  const byParent = new Map(); // parentIdx -> [{x,y,w,h,area}]
+  const pass1 = [];
+  const coveredParents = new Set();
   for (let i = 0; i < contours.size(); i++) {
     const cnt = contours.get(i);
     const parent = hierarchy.data32S[i * 4 + 3];
     if (parent !== -1) {
       pipeline.holeContours++;
       const rect = cv.boundingRect(cnt);
+      const area = cv.contourArea(cnt);
+      if (rect.width >= 4 && rect.height >= 4) {
+        if (!byParent.has(parent)) byParent.set(parent, []);
+        byParent.get(parent).push({ x: rect.x, y: rect.y, w: rect.width, h: rect.height, area });
+      }
       if (rect.width >= minDim && rect.height >= minDim) {
         pipeline.afterMinSize++;
         const rectArea = rect.width * rect.height;
-        const area = cv.contourArea(cnt);
-        candidates.push({
+        pass1.push({
           x: rect.x, y: rect.y, w: rect.width, h: rect.height,
           rectArea, fillRatio: area / rectArea,
           aspect: rect.height > 0 ? rect.width / rect.height : 0,
         });
+        coveredParents.add(parent);
       }
     }
     cnt.delete();
   }
 
+  const pass1Areas = pass1.map((c) => c.rectArea).sort((a, b) => a - b);
+  const medianArea = pass1Areas.length > 0 ? pass1Areas[Math.floor(pass1Areas.length / 2)] : 0;
+
+  // Fragment merge: only for parents none of whose children individually
+  // qualified — i.e. every fragment there is undersized, consistent with
+  // one cell's hole having been sliced up, not a fused mesh of real boxes
+  // (those already have legitimately cell-sized individual holes above).
+  const pass2 = [];
+  for (const [parent, kids] of byParent) {
+    if (coveredParents.has(parent)) continue;
+    const x0 = Math.min(...kids.map((k) => k.x));
+    const y0 = Math.min(...kids.map((k) => k.y));
+    const x1 = Math.max(...kids.map((k) => k.x + k.w));
+    const y1 = Math.max(...kids.map((k) => k.y + k.h));
+    const w = x1 - x0, h = y1 - y0;
+    const rectArea = w * h;
+    const totalArea = kids.reduce((s, k) => s + k.area, 0);
+    pass2.push({
+      x: x0, y: y0, w, h, rectArea,
+      fillRatio: rectArea > 0 ? totalArea / rectArea : 0,
+      aspect: h > 0 ? w / h : 0,
+    });
+  }
+  pipeline.mergedFragments = pass2.length;
+
+  const candidates = pass1.concat(pass2);
   let cells = [];
-  if (candidates.length > 0) {
-    const areas = candidates.map((c) => c.rectArea).sort((a, b) => a - b);
-    const medianArea = areas[Math.floor(areas.length / 2)];
+  if (candidates.length > 0 && medianArea > 0) {
     cells = candidates.filter((c) =>
       c.rectArea >= 0.4 * medianArea &&
       c.rectArea <= 2.2 * medianArea &&
       c.aspect >= 0.5 &&
       c.aspect <= 2.0 &&
-      c.fillRatio >= 0.5
+      c.fillRatio >= 0.3
     );
   }
   pipeline.afterShapeFilter = cells.length;
@@ -289,7 +348,7 @@ function findCells(canvas, minSizeFrac) {
 
   const cellThresh = cells.length >= 2 ? otsu1d(cells.map((c) => c.score)) : 0.5;
 
-  src.delete(); gray.delete(); blurred.delete(); binary.delete();
+  src.delete(); gray.delete(); blurred.delete(); binary.delete(); thin.delete();
   contours.delete(); hierarchy.delete();
 
   return { cells, cellThresh, maskCanvas, pipeline: { ...pipeline, minSizeFrac, imageW: canvas.width, imageH: canvas.height } };
@@ -403,7 +462,7 @@ function buildDiagnosticsText() {
     ``,
     `Image: ${W}x${H}`,
     `Expected total given: ${state.expectedTotal ?? "(none)"}`,
-    `Pipeline (last run): rawContours=${state.pipeline.rawContours} holeContours=${state.pipeline.holeContours} afterMinSize=${state.pipeline.afterMinSize} afterShapeFilter=${state.pipeline.afterShapeFilter} minSizeFrac=${state.pipeline.minSizeFrac}`,
+    `Pipeline (last run): rawContours=${state.pipeline.rawContours} holeContours=${state.pipeline.holeContours} afterMinSize=${state.pipeline.afterMinSize} mergedFragments=${state.pipeline.mergedFragments} afterShapeFilter=${state.pipeline.afterShapeFilter} minSizeFrac=${state.pipeline.minSizeFrac}`,
     `Detected cells: ${cells.length}`,
     `Cell size: width min=${widths[0]} median=${med(widths)} max=${widths[widths.length - 1]} | height min=${heights[0]} median=${med(heights)} max=${heights[heights.length - 1]}`,
     `Classification threshold (auto + slider adjust): ${effectiveThresh.toFixed(3)} (auto=${state.cellThresh.toFixed(3)}, slider adjust=${state.adjust.toFixed(3)})`,
