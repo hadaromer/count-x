@@ -10,10 +10,14 @@ browser — nothing gets uploaded anywhere.
 
 1. Upload a photo. That's it — it finds every box and counts the marked
    ones automatically.
-2. The photo shows every box it found outlined: thick green for boxes it
+2. If you happen to know the total number of boxes (a ballot, an
+   attendance sheet with a fixed roster, etc.), enter it — optional, but it
+   helps the detector calibrate, especially on forms with small printed
+   text (reference numbers, labels) right next to each box.
+3. The photo shows every box it found outlined: thick green for boxes it
    thinks are marked, thin blue for blank ones. Check it against the
    actual photo.
-3. If it's getting some wrong, drag the **sensitivity** slider — results
+4. If it's getting some wrong, drag the **sensitivity** slider — results
    update instantly, no reprocessing.
 
 Make sure the whole grid is visible in the photo (not cropped at the edge)
@@ -27,24 +31,43 @@ photo you upload, it:
 
 1. Thresholds it to a binary foreground mask (ink and borders both count as
    "foreground," blank paper doesn't).
-2. Finds every closed shape in that mask as its own contour
-   (`cv.findContours`, via [OpenCV.js](https://docs.opencv.org/4.x/d5/d10/tutorial_js_root.html)).
-3. Keeps only the contours that actually look like a box: close to the
-   same size as the other candidates (real cells cluster around one size;
-   stray text or noise usually doesn't), a reasonable aspect ratio, and a
-   high fill ratio — a hollow border rectangle's contour area is close to
-   its own bounding-box area, which is what tells a real box apart from a
-   disconnected ink blob like an X (low fill ratio) or a partial fragment
-   clipped at the photo's edge (also low).
+2. Finds every closed shape in that mask as a contour
+   (`cv.findContours`, via [OpenCV.js](https://docs.opencv.org/4.x/d5/d10/tutorial_js_root.html)),
+   using `RETR_CCOMP` and keeping each box's enclosed interior (a "hole" in
+   the border mesh) rather than its own outer ring. On a densely packed
+   form, adjacent boxes' borders often touch after the photo is resized —
+   that can fuse the whole grid into one connected blob under a simpler
+   "each box's own outer ring" approach, which catastrophically
+   undercounts. A box's hole stays correctly segmented even when the
+   surrounding mesh is fully fused, so this holds up regardless of how
+   tightly packed the boxes are.
+3. Keeps only the candidates big enough to plausibly be a box a person
+   could mark with a pen (a fixed minimum size relative to the photo) —
+   printed reference numbers/labels often contain characters like 0, 8, 9,
+   or 6 that have their own enclosed hole, identical in shape to a
+   checkbox's; this is what tells them apart, since a label's internal
+   counter is reliably much smaller than a real box, no matter how many of
+   them there are (which also makes a false positive only slightly more
+   likely to be filtered, not fundamentally fixed, by just excluding
+   outliers from the overall median). Among what's left: closeness to the
+   remaining pool's median size, a reasonable aspect ratio, and a high fill
+   ratio (contour area vs. its own bounding box — a hollow border rectangle
+   has that; a disconnected ink blob or a clipped fragment doesn't).
 4. For each box kept, crops an inset region (avoiding its own border) and
    measures how dark it is on average.
-5. Boxes darker than the sensitivity threshold are counted as marked.
+5. Finds the natural split between "blank" and "marked" scores via a
+   second, cell-level Otsu threshold over all the boxes' darkness scores
+   (not a fixed cutoff against pure white) — self-calibrates to whatever a
+   blank box actually looks like in this specific photo (handles non-white
+   cell fills, shadows, scan tint) and to whatever fraction of boxes are
+   actually marked.
 
 This is a "how dark is it" measurement, not real OCR — it doesn't care
 whether the mark is an X, a checkmark, or a scribble, just whether there's
 visible ink in the box. Validated against synthetic ground-truth grids
-across varied pen widths, cell sizes, rotation, and mark density before
-shipping.
+across varied pen widths, cell sizes, rotation, mark density from 5%-70%,
+non-white cell fills, zero-gap touching borders, and printed reference
+numbers with their own enclosed holes sitting next to every box.
 
 ## Running locally
 

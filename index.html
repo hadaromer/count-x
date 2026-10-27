@@ -24,6 +24,14 @@
         <button id="resetBtn" class="btn btn-ghost" disabled>Reset</button>
       </div>
 
+      <div class="controls-row">
+        <label class="threshold-label">
+          Total boxes, if you know it (optional)
+          <input type="number" id="expectedTotal" min="1" step="1" placeholder="e.g. 800" style="width:5.5rem" />
+        </label>
+        <span class="hint">Helps it calibrate — especially useful if there's small printed text (like reference numbers) right next to the boxes.</span>
+      </div>
+
       <div class="canvas-wrap" id="canvasWrap" hidden>
         <canvas id="viewCanvas"></canvas>
       </div>

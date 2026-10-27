@@ -1,6 +1,10 @@
 "use strict";
 
 const MAX_WORK_WIDTH = 1600;
+const DEFAULT_MIN_SIZE_FRAC = 0.015;
+// Swept when the user gives an expected total, to find whichever size floor
+// lands closest to it.
+const MIN_SIZE_FRAC_SWEEP = [0.006, 0.008, 0.01, 0.012, 0.015, 0.02, 0.025, 0.03, 0.04];
 
 const state = {
   cvReady: false,
@@ -85,6 +89,10 @@ el("thresholdSlider").addEventListener("input", (e) => {
   if (state.cells) renderResult();
 });
 
+el("expectedTotal").addEventListener("change", () => {
+  if (state.cells) detectAndClassify(); // re-run detection using the new target
+});
+
 // ── Detection ────────────────────────────────────────────────────────────────
 
 function detectAndClassify() {
@@ -92,8 +100,12 @@ function detectAndClassify() {
   el("resultsSection").hidden = true;
   // Let "Finding boxes…" paint before the synchronous CV work blocks the thread.
   setTimeout(() => {
+    const expectedRaw = el("expectedTotal").value.trim();
+    const expectedTotal = expectedRaw ? Math.max(1, parseInt(expectedRaw, 10)) : null;
     try {
-      const { cells, cellThresh } = findCells(state.workCanvas);
+      const { cells, cellThresh } = expectedTotal
+        ? findCellsBestMatch(state.workCanvas, expectedTotal)
+        : findCells(state.workCanvas, DEFAULT_MIN_SIZE_FRAC);
       state.cells = cells;
       state.cellThresh = cellThresh;
     } catch (err) {
@@ -110,8 +122,24 @@ function detectAndClassify() {
     state.adjust = 0;
     el("thresholdSlider").value = 0;
     el("thresholdValue").textContent = "auto";
-    renderResult();
+    renderResult(expectedTotal);
   }, 30);
+}
+
+// Tries a spread of size-floor settings (see findCells' minSizeFrac) and
+// keeps whichever gets the detected box count closest to a total the user
+// already knows — useful for forms with a known, fixed box count (ballots,
+// attendance sheets), and a good fallback if the default floor is a bit off
+// for an unusually small- or large-boxed form.
+function findCellsBestMatch(canvas, expectedTotal) {
+  let best = null;
+  for (const frac of MIN_SIZE_FRAC_SWEEP) {
+    const result = findCells(canvas, frac);
+    const diff = Math.abs(result.cells.length - expectedTotal);
+    if (!best || diff < best.diff) best = { ...result, diff };
+    if (diff === 0) break;
+  }
+  return best;
 }
 
 // Finds every bordered box in the image and scores how "inked" its interior
@@ -129,11 +157,21 @@ function detectAndClassify() {
 // by the border mesh even when the mesh itself is fully fused, so this is
 // robust either way.
 //
-// Among hole candidates, keep ones close in size to the candidate-pool
-// median (real cells cluster at one size; stray text/logos/barcodes
-// usually don't), a reasonable aspect ratio, and a fill ratio (contour
-// area vs. its own bounding-box area) that confirms it's actually a filled
-// hole shape rather than a sliver/fragment.
+// A real form's printed reference numbers/labels (e.g. "0", "8", "9", "6")
+// have their own enclosed holes topologically identical to a checkbox's —
+// findContours can't tell a hollow digit apart from a hollow box by shape
+// alone. What does tell them apart: a box a person can physically mark with
+// a pen occupies a non-trivial fraction of the page, while a printed
+// label's internal counter never does — regardless of how many such label
+// holes exist, which also makes it unsafe to anchor "typical cell size" on
+// a simple median/mode of all candidates (label holes can easily outnumber
+// real boxes). So minSizeFrac is applied as an absolute floor *before* the
+// median is computed, not as part of the relative size filter below it.
+//
+// Among the survivors, keep ones close in size to that filtered pool's
+// median (real cells cluster at one size), a reasonable aspect ratio, and a
+// fill ratio (contour area vs. its own bounding-box area) that confirms
+// it's a filled hole shape, not a sliver/fragment.
 //
 // Classification: per cell, measure darkness in an inset crop, then find
 // the natural split between "blank" and "marked" scores via a second,
@@ -143,9 +181,11 @@ function detectAndClassify() {
 // boxes are actually marked, rather than assuming marks are a minority.
 //
 // Validated against synthetic ground-truth grids across pen widths, cell
-// sizes, rotation, mark density from 5%-70%, non-white cell fills, and
-// adjacent cells with zero gap between borders — exact counts in all cases.
-function findCells(canvas) {
+// sizes, rotation, mark density from 5%-70%, non-white cell fills, adjacent
+// cells with zero gap between borders, and real printed reference numbers
+// (including digits with their own holes) sitting next to every box —
+// exact counts in all cases.
+function findCells(canvas, minSizeFrac) {
   const src = cv.imread(canvas);
   const gray = new cv.Mat();
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
@@ -158,14 +198,15 @@ function findCells(canvas) {
   const hierarchy = new cv.Mat();
   cv.findContours(binary, contours, hierarchy, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE);
 
+  const minDim = minSizeFrac * Math.min(canvas.width, canvas.height);
   const candidates = [];
   for (let i = 0; i < contours.size(); i++) {
     const cnt = contours.get(i);
     const parent = hierarchy.data32S[i * 4 + 3];
     if (parent !== -1) {
       const rect = cv.boundingRect(cnt);
-      const rectArea = rect.width * rect.height;
-      if (rectArea > 0) {
+      if (rect.width >= minDim && rect.height >= minDim) {
+        const rectArea = rect.width * rect.height;
         const area = cv.contourArea(cnt);
         candidates.push({
           x: rect.x, y: rect.y, w: rect.width, h: rect.height,
@@ -244,7 +285,7 @@ function otsu1d(values, nbins = 256) {
 
 // ── Rendering ────────────────────────────────────────────────────────────────
 
-function renderResult() {
+function renderResult(expectedTotal) {
   state.viewCtx.clearRect(0, 0, state.viewCanvas.width, state.viewCanvas.height);
   state.viewCtx.drawImage(state.workCanvas, 0, 0);
 
@@ -259,5 +300,9 @@ function renderResult() {
   }
 
   el("totalResult").textContent = `${count} marked`;
-  el("detectedNote").textContent = `${state.cells.length} boxes found — ${count} look marked, ${state.cells.length - count} blank.`;
+  let note = `${state.cells.length} boxes found — ${count} look marked, ${state.cells.length - count} blank.`;
+  if (expectedTotal && state.cells.length !== expectedTotal) {
+    note += ` (You said ${expectedTotal} total — closest match found, off by ${Math.abs(state.cells.length - expectedTotal)}. Check the photo covers every box clearly.)`;
+  }
+  el("detectedNote").textContent = note;
 }
