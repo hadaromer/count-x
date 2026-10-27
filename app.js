@@ -48,6 +48,17 @@ const STRINGS = {
 };
 const S = STRINGS[LANG];
 
+// Anonymous, cookie-free usage counts (GoatCounter). Only an event name is
+// ever sent — never the photo, the results, or anything about the sheet.
+// Silently does nothing if the script is blocked or not loaded.
+function track(name) {
+  try {
+    if (window.goatcounter && window.goatcounter.count) {
+      window.goatcounter.count({ path: name, title: name, event: true });
+    }
+  } catch (_) { /* analytics must never break the tool */ }
+}
+
 const state = {
   cvReady: false,
   workCanvas: document.createElement("canvas"),
@@ -57,6 +68,7 @@ const state = {
   adjust: 0,       // user's slider offset from cellThresh, -0.15..+0.15
   pipeline: null,  // stage counts from the most recent detection run, for diagnostics
   expectedTotal: null,
+  editTracked: false, // report only the first hand edit per photo
   maskCanvas: null,  // the binary threshold mask detection actually ran on, for visual debugging
   showingMask: false,
 };
@@ -163,6 +175,7 @@ function detectAndClassify() {
     const expectedRaw = el("expectedTotal").value.trim();
     const expectedTotal = expectedRaw ? Math.max(1, parseInt(expectedRaw, 10)) : null;
     state.expectedTotal = expectedTotal;
+    state.editTracked = false;
     try {
       const result = findGridCells(state.workCanvas);
       const { cells, cellThresh, pipeline, maskCanvas } = result;
@@ -172,13 +185,16 @@ function detectAndClassify() {
       state.maskCanvas = maskCanvas;
     } catch (err) {
       console.error(err);
+      track("analysis-error");
       el("status").textContent = S.failed;
       return;
     }
     if (state.cells.length === 0) {
+      track("no-grid-found");
       el("status").textContent = S.noBoxes;
       return;
     }
+    track("photo-analyzed");
     el("status").textContent = "";
     el("resultsSection").hidden = false;
     state.adjust = 0;
@@ -282,6 +298,7 @@ el("viewCanvas").addEventListener("click", (e) => {
     const s = sizes.length ? sizes[Math.floor(sizes.length / 2)] : 18;
     state.cells.push({ x: Math.round(px - s / 2), y: Math.round(py - s / 2), w: s, h: s, score: 1, manual: true, override: true });
   }
+  if (!state.editTracked) { state.editTracked = true; track("hand-edit"); }
   renderResult(state.expectedTotal);
 });
 
