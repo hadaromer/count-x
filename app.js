@@ -2,16 +2,17 @@
 
 const MAX_WORK_WIDTH = 1600;
 const DEFAULT_MIN_SIZE_FRAC = 0.015;
-// Swept when the user gives an expected total, to find whichever
-// (size floor, thresholding method) combination lands closest to it.
+// Swept when the user gives an expected total, to find whichever size floor
+// lands closest to it.
 const MIN_SIZE_FRAC_SWEEP = [0.006, 0.008, 0.01, 0.012, 0.015, 0.02, 0.025, 0.03, 0.04];
 
 const state = {
   cvReady: false,
   workCanvas: document.createElement("canvas"),
   viewCanvas: document.getElementById("viewCanvas"),
-  cells: null,  // [{x,y,w,h,ink,localThresh}] in workCanvas pixel coordinates, after detection
-  adjust: 0,    // user's slider offset from each cell's local threshold, -0.15..+0.15
+  cells: null,     // [{x,y,w,h,ink}] in workCanvas pixel coordinates, after detection
+  cellThresh: 0.5, // auto-computed split point between "blank" and "marked" ink scores
+  adjust: 0,       // user's slider offset from cellThresh, -0.15..+0.15
 };
 state.workCtx = state.workCanvas.getContext("2d");
 state.viewCtx = state.viewCanvas.getContext("2d");
@@ -102,9 +103,11 @@ function detectAndClassify() {
     const expectedRaw = el("expectedTotal").value.trim();
     const expectedTotal = expectedRaw ? Math.max(1, parseInt(expectedRaw, 10)) : null;
     try {
-      state.cells = expectedTotal
+      const { cells, cellThresh } = expectedTotal
         ? findCellsBestMatch(state.workCanvas, expectedTotal)
-        : findCells(state.workCanvas, DEFAULT_MIN_SIZE_FRAC, true);
+        : findCells(state.workCanvas, DEFAULT_MIN_SIZE_FRAC);
+      state.cells = cells;
+      state.cellThresh = cellThresh;
     } catch (err) {
       console.error(err);
       el("status").textContent = "Something went wrong analyzing that photo — try a different one.";
@@ -123,24 +126,20 @@ function detectAndClassify() {
   }, 30);
 }
 
-// Tries a spread of size-floor settings, with both thresholding methods
-// (see findCells), and keeps whichever combination gets the detected box
-// count closest to a total the user already knows — useful for forms with
-// a known, fixed box count (ballots, attendance sheets), and a good
-// fallback if the defaults don't fit a particular form's box/text sizing
-// or lighting.
+// Tries a spread of size-floor settings (see findCells' minSizeFrac) and
+// keeps whichever gets the detected box count closest to a total the user
+// already knows — useful for forms with a known, fixed box count (ballots,
+// attendance sheets), and a good fallback if the default floor is a bit off
+// for an unusually small- or large-boxed form.
 function findCellsBestMatch(canvas, expectedTotal) {
   let best = null;
-  outer:
-  for (const useAdaptive of [true, false]) {
-    for (const frac of MIN_SIZE_FRAC_SWEEP) {
-      const cells = findCells(canvas, frac, useAdaptive);
-      const diff = Math.abs(cells.length - expectedTotal);
-      if (!best || diff < best.diff) best = { cells, diff };
-      if (diff === 0) break outer;
-    }
+  for (const frac of MIN_SIZE_FRAC_SWEEP) {
+    const result = findCells(canvas, frac);
+    const diff = Math.abs(result.cells.length - expectedTotal);
+    if (!best || diff < best.diff) best = { ...result, diff };
+    if (diff === 0) break;
   }
-  return best.cells;
+  return best;
 }
 
 // Finds every bordered box in the image and scores how "inked" its interior
@@ -158,19 +157,6 @@ function findCellsBestMatch(canvas, expectedTotal) {
 // by the border mesh even when the mesh itself is fully fused, so this is
 // robust either way.
 //
-// Thresholding method: by default, ADAPTIVE (a local threshold computed per
-// neighborhood) rather than one global Otsu value for the whole photo. A
-// real photographed page is rarely lit perfectly evenly — a global
-// threshold tuned for the brighter side of the page can simply fail to
-// distinguish border lines from paper on a shadowed side, which doesn't
-// just misclassify a few boxes, it can prevent them from being detected as
-// shapes at all. Confirmed on a synthetic page with a left-to-right
-// lighting gradient: global Otsu detected 487/800 boxes (89 on the
-// shadowed side vs. 398 on the bright side); adaptive detected 800/800.
-// The one place global Otsu still wins is boxes with truly zero gap
-// between borders (adaptive's local averaging can blur that boundary) —
-// that's why findCellsBestMatch sweeps both when a known total is given.
-//
 // A real form's printed reference numbers/labels (e.g. "0", "8", "9", "6")
 // have their own enclosed holes topologically identical to a checkbox's —
 // findContours can't tell a hollow digit apart from a hollow box by shape
@@ -187,37 +173,26 @@ function findCellsBestMatch(canvas, expectedTotal) {
 // fill ratio (contour area vs. its own bounding-box area) that confirms
 // it's a filled hole shape, not a sliver/fragment.
 //
-// Classification: per cell, measure darkness in an inset crop. The split
-// between "blank" and "marked" is found via Otsu applied to the array of
-// per-cell darkness scores (not pixels) — self-calibrating to whatever a
-// blank box actually looks like (handles non-white cell fills, shadows,
-// scan tint) and to whatever fraction of boxes are actually marked, rather
-// than assuming marks are a minority. That split is computed per spatial
-// region (the image divided into tiles sized to stay well under one
-// lighting-gradient's scale, each needing a minimum pool of cells to
-// qualify, else it borrows the whole photo's split) rather than once
-// globally — same reasoning as the detection threshold: a single page-wide
-// split can't tell "darker because shadowed" apart from "darker because
-// marked." For a small or simple photo this reduces to exactly one region,
-// i.e. a single global split, unchanged from before.
+// Classification: per cell, measure darkness in an inset crop, then find
+// the natural split between "blank" and "marked" scores via a second,
+// cell-level Otsu threshold (not pixel-level) — this self-calibrates to
+// whatever a blank box actually looks like in this specific photo (handles
+// non-white cell fills, shadows, scan tint) and to whatever fraction of
+// boxes are actually marked, rather than assuming marks are a minority.
 //
 // Validated against synthetic ground-truth grids across pen widths, cell
 // sizes, rotation, mark density from 5%-70%, non-white cell fills, adjacent
-// cells with zero/near-zero gap between borders, real printed reference
-// numbers (including digits with their own holes) sitting next to every
-// box, and a simulated lighting gradient across an 800-box page.
-function findCells(canvas, minSizeFrac, useAdaptive) {
+// cells with zero gap between borders, and real printed reference numbers
+// (including digits with their own holes) sitting next to every box —
+// exact counts in all cases.
+function findCells(canvas, minSizeFrac) {
   const src = cv.imread(canvas);
   const gray = new cv.Mat();
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
   const blurred = new cv.Mat();
   cv.GaussianBlur(gray, blurred, new cv.Size(3, 3), 0);
   const binary = new cv.Mat();
-  if (useAdaptive) {
-    cv.adaptiveThreshold(blurred, binary, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY_INV, 35, 7);
-  } else {
-    cv.threshold(blurred, binary, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
-  }
+  cv.threshold(blurred, binary, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
 
   const contours = new cv.MatVector();
   const hierarchy = new cv.Mat();
@@ -269,40 +244,12 @@ function findCells(canvas, minSizeFrac, useAdaptive) {
     c.ink = 1 - meanVal / 255;
   }
 
-  assignLocalThresholds(cells, canvas.width, canvas.height);
+  const cellThresh = cells.length >= 2 ? otsu1d(cells.map((c) => c.ink)) : 0.5;
 
   src.delete(); gray.delete(); blurred.delete(); binary.delete();
   contours.delete(); hierarchy.delete();
 
-  return cells;
-}
-
-// Splits cells into spatial tiles (~500px square) and computes a separate
-// cell-level Otsu threshold per tile, falling back to one global split for
-// tiles with too few cells to split meaningfully. One cell, one image, or
-// one tightly-packed small photo all end up as a single tile — identical to
-// a single global threshold, which is what every non-lighting-gradient test
-// case already validated against.
-function assignLocalThresholds(cells, width, height) {
-  if (cells.length === 0) return;
-  if (cells.length < 2) { cells[0].localThresh = 0.5; return; }
-
-  const globalThresh = otsu1d(cells.map((c) => c.ink));
-  const tileW = width / Math.max(1, Math.round(width / 500));
-  const tileH = height / Math.max(1, Math.round(height / 500));
-
-  const buckets = new Map();
-  for (const c of cells) {
-    const key = `${Math.floor((c.x + c.w / 2) / tileW)},${Math.floor((c.y + c.h / 2) / tileH)}`;
-    if (!buckets.has(key)) buckets.set(key, []);
-    buckets.get(key).push(c);
-  }
-
-  const MIN_TILE_CELLS = 15;
-  for (const group of buckets.values()) {
-    const t = group.length >= MIN_TILE_CELLS ? otsu1d(group.map((c) => c.ink)) : globalThresh;
-    for (const c of group) c.localThresh = t;
-  }
+  return { cells, cellThresh };
 }
 
 // Otsu's method applied to an arbitrary array of continuous values instead
@@ -342,9 +289,10 @@ function renderResult(expectedTotal) {
   state.viewCtx.clearRect(0, 0, state.viewCanvas.width, state.viewCanvas.height);
   state.viewCtx.drawImage(state.workCanvas, 0, 0);
 
+  const effectiveThresh = state.cellThresh + state.adjust;
   let count = 0;
   for (const c of state.cells) {
-    const marked = c.ink >= c.localThresh + state.adjust;
+    const marked = c.ink >= effectiveThresh;
     if (marked) count++;
     state.viewCtx.strokeStyle = marked ? "#16a34a" : "rgba(37,99,235,0.35)";
     state.viewCtx.lineWidth = marked ? 3 : 1.5;
