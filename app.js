@@ -15,6 +15,8 @@ const state = {
   adjust: 0,       // user's slider offset from cellThresh, -0.15..+0.15
   pipeline: null,  // stage counts from the most recent detection run, for diagnostics
   expectedTotal: null,
+  maskCanvas: null,  // the binary threshold image findContours actually ran on, for visual debugging
+  showingMask: false,
 };
 state.workCtx = state.workCanvas.getContext("2d");
 state.viewCtx = state.viewCanvas.getContext("2d");
@@ -52,6 +54,8 @@ function loadImageFile(file) {
     el("canvasWrap").hidden = false;
     el("resetBtn").disabled = false;
     el("resultsSection").hidden = true;
+    state.showingMask = false;
+    el("showMaskBtn").textContent = "Show detection mask";
     URL.revokeObjectURL(url);
 
     if (!state.cvReady) {
@@ -97,6 +101,12 @@ el("expectedTotal").addEventListener("change", () => {
 
 el("copyDiagnosticsBtn").addEventListener("click", copyDiagnostics);
 
+el("showMaskBtn").addEventListener("click", () => {
+  state.showingMask = !state.showingMask;
+  el("showMaskBtn").textContent = state.showingMask ? "Show normal view" : "Show detection mask";
+  renderResult(state.expectedTotal);
+});
+
 // ── Detection ────────────────────────────────────────────────────────────────
 
 function detectAndClassify() {
@@ -108,12 +118,13 @@ function detectAndClassify() {
     const expectedTotal = expectedRaw ? Math.max(1, parseInt(expectedRaw, 10)) : null;
     state.expectedTotal = expectedTotal;
     try {
-      const { cells, cellThresh, pipeline } = expectedTotal
+      const { cells, cellThresh, pipeline, maskCanvas } = expectedTotal
         ? findCellsBestMatch(state.workCanvas, expectedTotal)
         : findCells(state.workCanvas, DEFAULT_MIN_SIZE_FRAC);
       state.cells = cells;
       state.cellThresh = cellThresh;
       state.pipeline = pipeline;
+      state.maskCanvas = maskCanvas;
     } catch (err) {
       console.error(err);
       el("status").textContent = "Something went wrong analyzing that photo — try a different one.";
@@ -194,6 +205,14 @@ function findCells(canvas, minSizeFrac) {
   const binary = new cv.Mat();
   cv.threshold(blurred, binary, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
 
+  // Keep a viewable copy of the exact binary mask findContours runs on —
+  // lets a user screenshot what the algorithm actually sees and share that
+  // back, since there's no way to read a photo shared in chat directly.
+  const maskCanvas = document.createElement("canvas");
+  maskCanvas.width = canvas.width;
+  maskCanvas.height = canvas.height;
+  cv.imshow(maskCanvas, binary);
+
   const contours = new cv.MatVector();
   const hierarchy = new cv.Mat();
   cv.findContours(binary, contours, hierarchy, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE);
@@ -253,7 +272,7 @@ function findCells(canvas, minSizeFrac) {
   src.delete(); gray.delete(); blurred.delete(); binary.delete();
   contours.delete(); hierarchy.delete();
 
-  return { cells, cellThresh, pipeline: { ...pipeline, minSizeFrac, imageW: canvas.width, imageH: canvas.height } };
+  return { cells, cellThresh, maskCanvas, pipeline: { ...pipeline, minSizeFrac, imageW: canvas.width, imageH: canvas.height } };
 }
 
 // Otsu's method applied to an arbitrary array of continuous values instead
@@ -291,6 +310,14 @@ function otsu1d(values, nbins = 256) {
 
 function renderResult(expectedTotal) {
   state.viewCtx.clearRect(0, 0, state.viewCanvas.width, state.viewCanvas.height);
+
+  if (state.showingMask && state.maskCanvas) {
+    state.viewCtx.drawImage(state.maskCanvas, 0, 0);
+    el("totalResult").textContent = "Detection mask";
+    el("detectedNote").textContent = "White = what the algorithm treats as ink/border. This is the exact image box-finding runs on — screenshot it if something looks off.";
+    return;
+  }
+
   state.viewCtx.drawImage(state.workCanvas, 0, 0);
 
   const effectiveThresh = state.cellThresh + state.adjust;
