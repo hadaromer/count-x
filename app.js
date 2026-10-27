@@ -13,6 +13,7 @@ const state = {
   cvReady: false,
   workCanvas: document.createElement("canvas"),
   viewCanvas: document.getElementById("viewCanvas"),
+  method: "blob",  // "blob" (default: classify every box by ink content) or "xshape" (experimental: find X's and green blobs directly)
   cells: null,     // [{x,y,w,h,fill,green,score}] in workCanvas pixel coordinates, after detection
   cellThresh: 0.5, // auto-computed split point between "blank" and "marked" scores
   adjust: 0,       // user's slider offset from cellThresh, -0.15..+0.15
@@ -106,6 +107,14 @@ el("expectedTotal").addEventListener("change", () => {
   if (state.cells) renderResult(state.expectedTotal);
 });
 
+el("methodSelect").addEventListener("change", (e) => {
+  state.method = e.target.value;
+  el("methodHint").textContent = state.method === "xshape"
+    ? "Experimental: looks for X-shaped crossing strokes and green highlighter directly, without locating boxes first. In testing this missed more marks and had more false positives than the default — here to compare against your own photo."
+    : "Finds every box, measures how inked it is. Catches X's, checkmarks, and highlighter fills alike.";
+  if (state.cells) detectAndClassify();
+});
+
 el("copyDiagnosticsBtn").addEventListener("click", copyDiagnostics);
 
 el("showMaskBtn").addEventListener("click", () => {
@@ -125,7 +134,9 @@ function detectAndClassify() {
     const expectedTotal = expectedRaw ? Math.max(1, parseInt(expectedRaw, 10)) : null;
     state.expectedTotal = expectedTotal;
     try {
-      const { cells, cellThresh, pipeline, maskCanvas } = findCells(state.workCanvas);
+      const { cells, cellThresh, pipeline, maskCanvas } = state.method === "xshape"
+        ? findXShapeMarks(state.workCanvas)
+        : findCells(state.workCanvas);
       state.cells = cells;
       state.cellThresh = cellThresh;
       state.pipeline = pipeline;
@@ -268,6 +279,126 @@ function findCells(canvas) {
   return { cells, cellThresh, maskCanvas, pipeline: { ...pipeline, imageW: canvas.width, imageH: canvas.height } };
 }
 
+// Experimental alternative to findCells: instead of locating every box and
+// measuring how inked it is, look for marks directly — X-shaped crossing
+// strokes (two diagonal line segments whose bounding boxes overlap, found
+// via Hough line detection) and green-highlighter blobs (a direct color
+// mask, not anchored to any box). No box/border reasoning at all.
+//
+// Tested in Python against the same stress-test form findCells is
+// validated against: 67-80% recall on actual X marks (vs. findCells'
+// 100%), some false positives from printed characters whose glyphs
+// contain their own diagonal strokes (e.g. "4", "7"), and — the bigger
+// problem — zero recall on marks that are highlighter-only with no X
+// stroke, which this specific form turned out to have plenty of. Kept as
+// a selectable mode rather than discarded so it can be compared directly
+// against a real photo instead of just my synthetic one.
+function findXShapeMarks(canvas) {
+  const src = cv.imread(canvas);
+  const gray = new cv.Mat();
+  cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+  const blurred = new cv.Mat();
+  cv.GaussianBlur(gray, blurred, new cv.Size(3, 3), 0);
+  const binary = new cv.Mat();
+  cv.threshold(blurred, binary, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
+
+  const maskCanvas = document.createElement("canvas");
+  maskCanvas.width = canvas.width;
+  maskCanvas.height = canvas.height;
+  cv.imshow(maskCanvas, binary);
+
+  const minDim = MIN_BOX_FRAC * Math.min(canvas.width, canvas.height);
+  const maxDim = MAX_BOX_FRAC * Math.min(canvas.width, canvas.height);
+  const pipeline = { xCandidates: 0, greenCandidates: 0, afterShapeFilter: 0 };
+
+  // ── X-shape matches: pair up diagonal Hough line segments ──
+  const lines = new cv.Mat();
+  cv.HoughLinesP(binary, lines, 1, Math.PI / 180, 12, Math.max(6, minDim * 0.5), 2);
+  const diagA = [], diagB = []; // ~45° and ~135°, since an X is two opposing diagonals
+  for (let i = 0; i < lines.rows; i++) {
+    const x1 = lines.data32S[i * 4], y1 = lines.data32S[i * 4 + 1];
+    const x2 = lines.data32S[i * 4 + 2], y2 = lines.data32S[i * 4 + 3];
+    const length = Math.hypot(x2 - x1, y2 - y1);
+    if (length < minDim * 0.5 || length > maxDim * 1.2) continue;
+    const angle = ((Math.atan2(y2 - y1, x2 - x1) * 180) / Math.PI + 180) % 180;
+    const seg = { x0: Math.min(x1, x2), y0: Math.min(y1, y2), x1: Math.max(x1, x2), y1: Math.max(y1, y2) };
+    if (angle >= 25 && angle <= 65) diagA.push(seg);
+    else if (angle >= 115 && angle <= 155) diagB.push(seg);
+  }
+  lines.delete();
+
+  const xMarks = [];
+  const usedB = new Set();
+  for (const a of diagA) {
+    let best = -1, bestScore = -1;
+    for (let j = 0; j < diagB.length; j++) {
+      if (usedB.has(j)) continue;
+      const b = diagB[j];
+      const ox = Math.min(a.x1, b.x1) - Math.max(a.x0, b.x0);
+      const oy = Math.min(a.y1, b.y1) - Math.max(a.y0, b.y0);
+      if (ox <= 0 || oy <= 0) continue; // the two diagonals must actually cross, not just sit nearby
+      const x0 = Math.min(a.x0, b.x0), y0 = Math.min(a.y0, b.y0);
+      const x1 = Math.max(a.x1, b.x1), y1 = Math.max(a.y1, b.y1);
+      const w = x1 - x0, h = y1 - y0;
+      if (w < minDim || w > maxDim || h < minDim || h > maxDim) continue;
+      const aspect = h > 0 ? w / h : 0;
+      if (aspect < 0.5 || aspect > 2.0) continue;
+      const score = Math.min(ox, oy);
+      if (score > bestScore) { bestScore = score; best = j; }
+    }
+    if (best !== -1) {
+      usedB.add(best);
+      const b = diagB[best];
+      const x0 = Math.min(a.x0, b.x0), y0 = Math.min(a.y0, b.y0);
+      const x1 = Math.max(a.x1, b.x1), y1 = Math.max(a.y1, b.y1);
+      xMarks.push({ x: x0, y: y0, w: x1 - x0, h: y1 - y0, score: 0.8, kind: "x" });
+    }
+  }
+  pipeline.xCandidates = xMarks.length;
+
+  // ── Green blobs: direct color mask, not anchored to any box ──
+  const channels = new cv.MatVector();
+  cv.split(src, channels);
+  const avgRB = new cv.Mat();
+  cv.addWeighted(channels.get(0), 0.5, channels.get(2), 0.5, 0, avgRB);
+  const greenDiff = new cv.Mat();
+  cv.subtract(channels.get(1), avgRB, greenDiff);
+  const greenMask = new cv.Mat();
+  cv.threshold(greenDiff, greenMask, 15, 255, cv.THRESH_BINARY);
+  channels.delete(); avgRB.delete(); greenDiff.delete();
+
+  const gLabels = new cv.Mat(), gStats = new cv.Mat(), gCentroids = new cv.Mat();
+  const gNumLabels = cv.connectedComponentsWithStats(greenMask, gLabels, gStats, gCentroids, 8, cv.CV_32S);
+  greenMask.delete(); gLabels.delete(); gCentroids.delete();
+  const greenMarks = [];
+  for (let i = 1; i < gNumLabels; i++) {
+    const w = gStats.data32S[i * 5 + 2], h = gStats.data32S[i * 5 + 3];
+    if (w < minDim || w > maxDim || h < minDim || h > maxDim) continue;
+    const aspect = h > 0 ? w / h : 0;
+    if (aspect < 0.5 || aspect > 2.0) continue;
+    const area = gStats.data32S[i * 5 + 4];
+    greenMarks.push({
+      x: gStats.data32S[i * 5], y: gStats.data32S[i * 5 + 1], w, h,
+      score: Math.min(1, area / (w * h) + 0.3), kind: "green",
+    });
+  }
+  gStats.delete();
+  pipeline.greenCandidates = greenMarks.length;
+
+  // Union the two signals, dropping an X match that's basically on top of
+  // an already-found green blob (same mark, found twice).
+  const cells = greenMarks.slice();
+  for (const m of xMarks) {
+    const dup = cells.some((c) => Math.abs(c.x - m.x) < minDim * 0.5 && Math.abs(c.y - m.y) < minDim * 0.5);
+    if (!dup) cells.push(m);
+  }
+  pipeline.afterShapeFilter = cells.length;
+
+  src.delete(); gray.delete(); blurred.delete(); binary.delete();
+
+  return { cells, cellThresh: 0.4, maskCanvas, pipeline: { ...pipeline, imageW: canvas.width, imageH: canvas.height } };
+}
+
 // Otsu's method applied to an arbitrary array of continuous values instead
 // of an 8-bit pixel histogram — finds the threshold that best separates the
 // array into two clusters by maximizing between-cluster variance.
@@ -324,9 +455,14 @@ function renderResult(expectedTotal) {
   }
 
   el("totalResult").textContent = `${count} marked`;
-  let note = `${state.cells.length} boxes found — ${count} look marked, ${state.cells.length - count} blank.`;
-  if (expectedTotal && state.cells.length !== expectedTotal) {
-    note += ` (You said ${expectedTotal} total — found ${state.cells.length}, off by ${Math.abs(state.cells.length - expectedTotal)}. Check the photo covers every box clearly.)`;
+  let note = state.method === "xshape"
+    ? `${count} marks found directly (X-shapes and green blobs) — this mode doesn't locate blank boxes.`
+    : `${state.cells.length} boxes found — ${count} look marked, ${state.cells.length - count} blank.`;
+  if (expectedTotal) {
+    const against = state.method === "xshape" ? count : state.cells.length;
+    if (against !== expectedTotal) {
+      note += ` (You said ${expectedTotal} total — found ${against}, off by ${Math.abs(against - expectedTotal)}.)`;
+    }
   }
   el("detectedNote").textContent = note;
 }
@@ -367,16 +503,22 @@ function buildDiagnosticsText() {
   const heights = cells.map((c) => c.h).sort((a, b) => a - b);
   const med = (arr) => arr[Math.floor(arr.length / 2)];
 
-  const sample = cells.slice(0, 25).map((c) =>
-    `  x=${c.x} y=${c.y} w=${c.w} h=${c.h} fill=${c.fill.toFixed(3)} green=${c.green.toFixed(3)} score=${c.score.toFixed(3)} marked=${c.score >= effectiveThresh}`
-  );
+  const sample = cells.slice(0, 25).map((c) => {
+    const extra = state.method === "xshape"
+      ? `kind=${c.kind}`
+      : `fill=${c.fill.toFixed(3)} green=${c.green.toFixed(3)}`;
+    return `  x=${c.x} y=${c.y} w=${c.w} h=${c.h} ${extra} score=${c.score.toFixed(3)} marked=${c.score >= effectiveThresh}`;
+  });
 
   return [
     `Count X diagnostics — ${new Date().toISOString()}`,
     ``,
     `Image: ${W}x${H}`,
     `Expected total given: ${state.expectedTotal ?? "(none)"}`,
-    `Pipeline (last run): rawComponents=${state.pipeline.rawComponents} plausibleSized=${state.pipeline.plausibleSized} modeWidth=${state.pipeline.modeWidth} afterShapeFilter=${state.pipeline.afterShapeFilter}`,
+    `Method: ${state.method}`,
+    state.method === "xshape"
+      ? `Pipeline (last run): xCandidates=${state.pipeline.xCandidates} greenCandidates=${state.pipeline.greenCandidates} afterShapeFilter=${state.pipeline.afterShapeFilter}`
+      : `Pipeline (last run): rawComponents=${state.pipeline.rawComponents} plausibleSized=${state.pipeline.plausibleSized} modeWidth=${state.pipeline.modeWidth} afterShapeFilter=${state.pipeline.afterShapeFilter}`,
     `Detected cells: ${cells.length}`,
     `Cell size: width min=${widths[0]} median=${med(widths)} max=${widths[widths.length - 1]} | height min=${heights[0]} median=${med(heights)} max=${heights[heights.length - 1]}`,
     `Classification threshold (auto + slider adjust): ${effectiveThresh.toFixed(3)} (auto=${state.cellThresh.toFixed(3)}, slider adjust=${state.adjust.toFixed(3)})`,

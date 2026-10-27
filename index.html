@@ -32,6 +32,17 @@
         <span class="hint">Optional — shown next to the result so you can sanity-check the count, doesn't change detection.</span>
       </div>
 
+      <div class="controls-row">
+        <label class="threshold-label">
+          Detection method
+          <select id="methodSelect">
+            <option value="blob">Box ink (default)</option>
+            <option value="xshape">X-shape matching (experimental)</option>
+          </select>
+        </label>
+        <span class="hint" id="methodHint">Finds every box, measures how inked it is. Catches X's, checkmarks, and highlighter fills alike.</span>
+      </div>
+
       <div class="canvas-wrap" id="canvasWrap" hidden>
         <canvas id="viewCanvas"></canvas>
       </div>
