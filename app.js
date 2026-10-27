@@ -1,21 +1,24 @@
 "use strict";
 
 const MAX_WORK_WIDTH = 1600;
-const DEFAULT_MIN_SIZE_FRAC = 0.015;
-// Swept when the user gives an expected total, to find whichever size floor
-// lands closest to it.
-const MIN_SIZE_FRAC_SWEEP = [0.006, 0.008, 0.01, 0.012, 0.015, 0.02, 0.025, 0.03, 0.04];
+// Bounds (relative to the photo's shorter side) a checkbox-sized connected
+// component must fall within to even be considered — wide enough to cover
+// everything from a cramped ballot grid to a loose attendance sheet,
+// narrow enough to exclude single printed characters and whole fused
+// multi-box blobs. The real size is then found per-photo from the mode of
+// what falls inside this range (see findCells).
+const MIN_BOX_FRAC = 0.008, MAX_BOX_FRAC = 0.05;
 
 const state = {
   cvReady: false,
   workCanvas: document.createElement("canvas"),
   viewCanvas: document.getElementById("viewCanvas"),
-  cells: null,     // [{x,y,w,h,ink}] in workCanvas pixel coordinates, after detection
-  cellThresh: 0.5, // auto-computed split point between "blank" and "marked" ink scores
+  cells: null,     // [{x,y,w,h,fill,green,score}] in workCanvas pixel coordinates, after detection
+  cellThresh: 0.5, // auto-computed split point between "blank" and "marked" scores
   adjust: 0,       // user's slider offset from cellThresh, -0.15..+0.15
   pipeline: null,  // stage counts from the most recent detection run, for diagnostics
   expectedTotal: null,
-  maskCanvas: null,  // the binary threshold image findContours actually ran on, for visual debugging
+  maskCanvas: null,  // the binary threshold mask detection actually ran on, for visual debugging
   showingMask: false,
 };
 state.workCtx = state.workCanvas.getContext("2d");
@@ -96,7 +99,11 @@ el("thresholdSlider").addEventListener("input", (e) => {
 });
 
 el("expectedTotal").addEventListener("change", () => {
-  if (state.cells) detectAndClassify(); // re-run detection using the new target
+  // Detection no longer depends on this — it's just shown for context —
+  // so just update the note rather than redoing all the CV work.
+  const raw = el("expectedTotal").value.trim();
+  state.expectedTotal = raw ? Math.max(1, parseInt(raw, 10)) : null;
+  if (state.cells) renderResult(state.expectedTotal);
 });
 
 el("copyDiagnosticsBtn").addEventListener("click", copyDiagnostics);
@@ -110,17 +117,15 @@ el("showMaskBtn").addEventListener("click", () => {
 // ── Detection ────────────────────────────────────────────────────────────────
 
 function detectAndClassify() {
-  el("status").textContent = "Finding boxes…";
+  el("status").textContent = "Finding marks…";
   el("resultsSection").hidden = true;
-  // Let "Finding boxes…" paint before the synchronous CV work blocks the thread.
+  // Let "Finding marks…" paint before the synchronous CV work blocks the thread.
   setTimeout(() => {
     const expectedRaw = el("expectedTotal").value.trim();
     const expectedTotal = expectedRaw ? Math.max(1, parseInt(expectedRaw, 10)) : null;
     state.expectedTotal = expectedTotal;
     try {
-      const { cells, cellThresh, pipeline, maskCanvas } = expectedTotal
-        ? findCellsBestMatch(state.workCanvas, expectedTotal)
-        : findCells(state.workCanvas, DEFAULT_MIN_SIZE_FRAC);
+      const { cells, cellThresh, pipeline, maskCanvas } = findCells(state.workCanvas);
       state.cells = cells;
       state.cellThresh = cellThresh;
       state.pipeline = pipeline;
@@ -143,82 +148,37 @@ function detectAndClassify() {
   }, 30);
 }
 
-// Tries a spread of size-floor settings (see findCells' minSizeFrac) and
-// keeps whichever gets the detected box count closest to a total the user
-// already knows — useful for forms with a known, fixed box count (ballots,
-// attendance sheets), and a good fallback if the default floor is a bit off
-// for an unusually small- or large-boxed form.
-function findCellsBestMatch(canvas, expectedTotal) {
-  let best = null;
-  for (const frac of MIN_SIZE_FRAC_SWEEP) {
-    const result = findCells(canvas, frac);
-    const diff = Math.abs(result.cells.length - expectedTotal);
-    if (!best || diff < best.diff) best = { ...result, diff };
-    if (diff === 0) break;
-  }
-  return best;
-}
-
-// Finds every bordered box in the image and scores how "inked" its interior
-// is, fully automatically — no corners or grid size from the user.
+// Finds every marked box in the image directly — not by first reconstructing
+// the grid of boxes and then inspecting each one, but by measuring how
+// "inked" every connected blob in the photo is and keeping the ones that
+// look like a box. This replaced an approach built around finding each
+// box's border first (contour holes, with increasingly elaborate handling
+// for marks that damage a hole): that whole direction kept being undermined
+// by the fact that marking a box is specifically what breaks its hole, so
+// detection and classification were fighting each other. Measuring "how
+// inked is this blob" directly sidesteps that entirely.
 //
-// Detection: threshold the photo to a binary foreground mask (ink + borders
-// both count as foreground, blank paper doesn't), then find contours with
-// RETR_CCOMP and keep only the HOLE contours (those with a parent) — each
-// box's enclosed interior is a hole inside its border. This matters because
-// on a densely packed real form, adjacent boxes' borders routinely touch or
-// come within a pixel of each other after the photo's resized/thresholded;
-// that can fuse the whole grid into one connected blob under a simpler
-// "take each box's own outer ring" approach (RETR_EXTERNAL), which
-// catastrophically undercounts. Each box's hole stays correctly segmented
-// by the border mesh even when the mesh itself is fully fused, so this is
-// robust either way.
+// Detection: threshold the photo to a binary foreground mask (ink and
+// borders both count as foreground, blank paper doesn't), then take every
+// connected blob (`cv.connectedComponentsWithStats`) as a candidate — no
+// hole/contour-hierarchy reasoning at all. A blank box's blob is just its
+// thin border ring, low fill ratio (contour area vs. its own bounding box).
+// A marked box's blob includes whatever's inside it — a highlighter fill or
+// an X — so its fill ratio is substantially higher. That's the whole
+// classification signal, and it turns out to separate blank from marked
+// far more cleanly than measuring interior darkness ever did, because it's
+// reading the box's actual ink content instead of trying to infer it from
+// a hole that marking itself damages.
 //
-// Before contour-finding, strip the mask down to thin strokes only, via
-// distanceTransform (each foreground pixel's distance to the nearest
-// background pixel — low for a thin printed border or pen line, high for
-// a solid interior fill or thick ink). A MARKED box's interior ink — a
-// highlighter fill, or an X whose diagonals touch the border at multiple
-// points — destroys that box's hole entirely or slices it into undersized
-// fragments; without this step, a marked box simply disappears from
-// detection rather than being misclassified. Stripping out everything but
-// thin strokes first recovers the border (and its hole) regardless of
-// what's marked inside it.
-//
-// A real form's printed reference numbers/labels (e.g. "0", "8", "9", "6")
-// have their own enclosed holes topologically identical to a checkbox's —
-// findContours can't tell a hollow digit apart from a hollow box by shape
-// alone. What does tell them apart: a box a person can physically mark with
-// a pen occupies a non-trivial fraction of the page, while a printed
-// label's internal counter never does — regardless of how many such label
-// holes exist, which also makes it unsafe to anchor "typical cell size" on
-// a simple median/mode of all candidates (label holes can easily outnumber
-// real boxes). So minSizeFrac is applied as an absolute floor *before* the
-// median is computed, not as part of the relative size filter below it.
-//
-// Among the survivors, keep ones close in size to that filtered pool's
-// median (real cells cluster at one size), a reasonable aspect ratio, and a
-// fill ratio (contour area vs. its own bounding-box area) that confirms
-// it's a filled hole shape, not a sliver/fragment. A second pass handles
-// boxes whose hole got sliced into several undersized fragments (an X
-// touching the border at multiple points): fragments that share a parent
-// border and whose *combined* footprint is cell-sized are merged into one
-// candidate — but only when none of that parent's fragments were already
-// cell-sized alone, so a genuinely fused mesh of many separate blank boxes
-// (which legitimately share one parent) is never merged into a single
-// giant box.
-//
-// Classification: per cell, measure two independent signals in an inset
-// crop — grayscale darkness (pen ink, pencil) and "greenness" (G channel
-// vs. the other two, for highlighter-style marks that are barely darker
-// than blank paper and so are invisible to a pure darkness score). A cell's
-// mark score is the stronger of the two. Then find the natural split
-// between "blank" and "marked" scores via a second, cell-level Otsu
-// threshold (not pixel-level) — this self-calibrates to whatever a blank
-// box actually looks like in this specific photo (handles non-white cell
-// fills, shadows, scan tint) and to whatever fraction of boxes are
-// actually marked, rather than assuming marks are a minority.
-function findCells(canvas, minSizeFrac) {
+// A printed reference number/label next to each box (e.g. "0", "8", "9")
+// is its own small blob with its own fill ratio — sometimes close to a
+// real mark's, so size is still needed to exclude it, but size alone
+// doesn't need to be exact: real boxes are far more uniform in size than
+// scattered label text, so the photo's actual box size is found from the
+// *mode* of blob widths in a generous plausible range (MIN_BOX_FRAC to
+// MAX_BOX_FRAC of the photo's shorter side) rather than assumed in advance
+// or sized against a contaminated median.
+function findCells(canvas) {
   const src = cv.imread(canvas);
   const gray = new cv.Mat();
   cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
@@ -227,162 +187,85 @@ function findCells(canvas, minSizeFrac) {
   const binary = new cv.Mat();
   cv.threshold(blurred, binary, 0, 255, cv.THRESH_BINARY_INV + cv.THRESH_OTSU);
 
-  const dist = new cv.Mat();
-  cv.distanceTransform(binary, dist, cv.DIST_L2, 3);
-  const thinRaw = new cv.Mat();
-  cv.threshold(dist, thinRaw, 2.2, 255, cv.THRESH_BINARY_INV);
-  const thin = new cv.Mat();
-  thinRaw.convertTo(thin, cv.CV_8U);
-  cv.bitwise_and(thin, binary, thin); // THRESH_BINARY_INV also marks background (dist=0) — restrict back to foreground
-  dist.delete(); thinRaw.delete();
-
-  // Keep a viewable copy of the exact mask findContours runs on — lets a
-  // user screenshot what the algorithm actually sees and share that back,
-  // since there's no way to read a photo shared in chat directly.
+  // Keep a viewable copy of the exact mask detection runs on — lets a user
+  // screenshot what the algorithm actually sees and share that back, since
+  // there's no way to read a photo shared in chat directly.
   const maskCanvas = document.createElement("canvas");
   maskCanvas.width = canvas.width;
   maskCanvas.height = canvas.height;
-  cv.imshow(maskCanvas, thin);
+  cv.imshow(maskCanvas, binary);
 
-  const contours = new cv.MatVector();
-  const hierarchy = new cv.Mat();
-  cv.findContours(thin, contours, hierarchy, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE);
+  const labels = new cv.Mat();
+  const stats = new cv.Mat();
+  const centroids = new cv.Mat();
+  const numLabels = cv.connectedComponentsWithStats(binary, labels, stats, centroids, 8, cv.CV_32S);
 
-  const minDim = minSizeFrac * Math.min(canvas.width, canvas.height);
-  const pipeline = { rawContours: contours.size(), holeContours: 0, afterMinSize: 0, mergedFragments: 0, afterShapeFilter: 0 };
+  const minDim = MIN_BOX_FRAC * Math.min(canvas.width, canvas.height);
+  const maxDim = MAX_BOX_FRAC * Math.min(canvas.width, canvas.height);
+  const pipeline = { rawComponents: numLabels - 1, plausibleSized: 0, modeWidth: 0, afterShapeFilter: 0 };
 
-  // A real box hole, after thinning, is a near-complete rectangle: high
-  // fill ratio (contour area vs. its own bounding box), close to square. A
-  // printed label character's hole (0, 6, 8, 9) almost never reaches that
-  // fill ratio even when its size overlaps a small box — so this is a much
-  // more reliable box/digit discriminator than size alone (sizes can
-  // genuinely overlap at low photo resolution; fill ratio rarely does).
-  const FILL_MIN = 0.65, ASPECT_LO = 0.7, ASPECT_HI = 1.4;
-
-  const pass1 = [];
-  const leftover = []; // fragments that failed pass1 on their own — merge candidates
-  for (let i = 0; i < contours.size(); i++) {
-    const cnt = contours.get(i);
-    const parent = hierarchy.data32S[i * 4 + 3];
-    if (parent !== -1) {
-      pipeline.holeContours++;
-      const rect = cv.boundingRect(cnt);
-      const area = cv.contourArea(cnt);
-      if (rect.width >= 4 && rect.height >= 4) {
-        const rectArea = rect.width * rect.height;
-        const fillRatio = area / rectArea;
-        const aspect = rect.height > 0 ? rect.width / rect.height : 0;
-        const accepted = rect.width >= minDim && rect.height >= minDim &&
-          fillRatio >= FILL_MIN && aspect >= ASPECT_LO && aspect <= ASPECT_HI;
-        if (accepted) {
-          pipeline.afterMinSize++;
-          pass1.push({ x: rect.x, y: rect.y, w: rect.width, h: rect.height, rectArea, fillRatio, aspect });
-        } else {
-          leftover.push({ x: rect.x, y: rect.y, w: rect.width, h: rect.height, area });
-        }
-      }
-    }
-    cnt.delete();
+  const comps = [];
+  for (let i = 1; i < numLabels; i++) { // label 0 is background
+    const x = stats.data32S[i * 5 + 0], y = stats.data32S[i * 5 + 1];
+    const w = stats.data32S[i * 5 + 2], h = stats.data32S[i * 5 + 3];
+    const area = stats.data32S[i * 5 + 4];
+    comps.push({ x, y, w, h, area });
   }
+  labels.delete(); stats.delete(); centroids.delete();
 
-  const pass1Areas = pass1.map((c) => c.rectArea).sort((a, b) => a - b);
-  const medianArea = pass1Areas.length > 0 ? pass1Areas[Math.floor(pass1Areas.length / 2)] : 0;
+  const plausible = comps.filter((c) => c.w >= minDim && c.w <= maxDim && c.h >= minDim && c.h <= maxDim);
+  pipeline.plausibleSized = plausible.length;
 
-  // Fragment merge: a mark that touches a box's border at several points
-  // (e.g. an X reaching corner to corner) can slice its hole into several
-  // undersized pieces, each failing pass1 alone. Group leftover fragments
-  // by actual spatial adjacency (bounding boxes touching/overlapping
-  // within a tight tolerance) rather than by findContours' own parent
-  // index — a shared parent isn't reliable evidence of belonging to the
-  // same cell (it can silently span into neighboring structure), but two
-  // fragments whose boxes are only ~1px apart are almost certainly pieces
-  // of the same broken stroke. The tolerance is far smaller than the real
-  // gap between adjacent boxes, so this never bridges two different cells.
-  const gapTol = 1;
-  const n = leftover.length;
-  const parentIdx = new Array(n);
-  for (let i = 0; i < n; i++) parentIdx[i] = i;
-  const find = (a) => { while (parentIdx[a] !== a) { parentIdx[a] = parentIdx[parentIdx[a]]; a = parentIdx[a]; } return a; };
-  const union = (a, b) => { const ra = find(a), rb = find(b); if (ra !== rb) parentIdx[ra] = rb; };
-  const touches = (f1, f2) =>
-    !(f1.x - gapTol > f2.x + f2.w || f2.x - gapTol > f1.x + f1.w ||
-      f1.y - gapTol > f2.y + f2.h || f2.y - gapTol > f1.y + f1.h);
-  for (let i = 0; i < n; i++) {
-    for (let j = i + 1; j < n; j++) {
-      if (touches(leftover[i], leftover[j])) union(i, j);
-    }
-  }
-  const clusters = new Map();
-  for (let i = 0; i < n; i++) {
-    const root = find(i);
-    if (!clusters.has(root)) clusters.set(root, []);
-    clusters.get(root).push(leftover[i]);
-  }
-
-  const FRAG_FILL_MIN = 0.3;
-  const pass2 = [];
-  for (const kids of clusters.values()) {
-    if (kids.length < 2) continue; // a lone low-fill fragment is more likely a digit than a sliced box
-    const x0 = Math.min(...kids.map((k) => k.x));
-    const y0 = Math.min(...kids.map((k) => k.y));
-    const x1 = Math.max(...kids.map((k) => k.x + k.w));
-    const y1 = Math.max(...kids.map((k) => k.y + k.h));
-    const w = x1 - x0, h = y1 - y0;
-    const rectArea = w * h;
-    const totalArea = kids.reduce((s, k) => s + k.area, 0);
-    const fillRatio = rectArea > 0 ? totalArea / rectArea : 0;
-    const aspect = h > 0 ? w / h : 0;
-    if (w >= minDim && h >= minDim && fillRatio >= FRAG_FILL_MIN && aspect >= ASPECT_LO && aspect <= ASPECT_HI) {
-      pass2.push({ x: x0, y: y0, w, h, rectArea, fillRatio, aspect });
-    }
-  }
-  pipeline.mergedFragments = pass2.length;
-
-  const candidates = pass1.concat(pass2);
   let cells = [];
-  if (candidates.length > 0 && medianArea > 0) {
-    cells = candidates.filter((c) =>
-      c.rectArea >= 0.4 * medianArea &&
-      c.rectArea <= 2.2 * medianArea
-    );
+  if (plausible.length > 0) {
+    const bucketWidth = 2;
+    const hist = new Map();
+    for (const c of plausible) {
+      const bucket = Math.round(c.w / bucketWidth) * bucketWidth;
+      hist.set(bucket, (hist.get(bucket) || 0) + 1);
+    }
+    let modeWidth = 0, modeCount = 0;
+    for (const [bucket, count] of hist) {
+      if (count > modeCount) { modeCount = count; modeWidth = bucket; }
+    }
+    pipeline.modeWidth = modeWidth;
+
+    cells = comps
+      .filter((c) =>
+        c.w >= 0.5 * modeWidth && c.w <= 2.2 * modeWidth &&
+        c.h >= 0.5 * modeWidth && c.h <= 2.2 * modeWidth &&
+        c.w / c.h >= 0.5 && c.w / c.h <= 2.0
+      )
+      .map((c) => ({ x: c.x, y: c.y, w: c.w, h: c.h, fill: c.area / (c.w * c.h) }));
   }
   pipeline.afterShapeFilter = cells.length;
 
+  // Green highlighter is often too light to show up in the fill ratio
+  // above (it's a mask over the grayscale-thresholded image, and
+  // highlighter is barely darker than blank paper). Measure it directly as
+  // a second signal — how much an inset crop's average color leans green
+  // (G channel vs. the other two) — and count a box as marked if either
+  // signal is strong.
   const insetFrac = 0.12;
   for (const c of cells) {
     const insetX = Math.round(c.w * insetFrac);
     const insetY = Math.round(c.h * insetFrac);
     const rw = c.w - 2 * insetX;
     const rh = c.h - 2 * insetY;
-    if (rw <= 0 || rh <= 0) { c.ink = 0; c.green = 0; c.score = 0; continue; }
-    const rect = new cv.Rect(c.x + insetX, c.y + insetY, rw, rh);
-
-    const roi = gray.roi(rect);
-    const meanVal = cv.mean(roi)[0];
-    roi.delete();
-    c.ink = 1 - meanVal / 255;
-
-    // Marks on this form aren't just dark pen ink — many are a green
-    // highlighter, which grayscale darkness barely registers (highlighter
-    // is light) and can't tell apart from the form's own printed grid
-    // lines/shadow anyway. Measure how much the interior's average color
-    // leans green (G channel vs. the other two) as a second, independent
-    // signal; a cell counts as marked if *either* signal is strong.
-    const roiColor = src.roi(rect);
+    if (rw <= 0 || rh <= 0) { c.green = 0; c.score = c.fill; continue; }
+    const roiColor = src.roi(new cv.Rect(c.x + insetX, c.y + insetY, rw, rh));
     const meanColor = cv.mean(roiColor);
     roiColor.delete();
     const greenDiff = meanColor[1] - (meanColor[0] + meanColor[2]) / 2;
     c.green = Math.max(0, Math.min(1, greenDiff / 50));
-
-    c.score = Math.max(c.ink, c.green);
+    c.score = Math.max(c.fill, c.green);
   }
 
   const cellThresh = cells.length >= 2 ? otsu1d(cells.map((c) => c.score)) : 0.5;
 
-  src.delete(); gray.delete(); blurred.delete(); binary.delete(); thin.delete();
-  contours.delete(); hierarchy.delete();
+  src.delete(); gray.delete(); blurred.delete(); binary.delete();
 
-  return { cells, cellThresh, maskCanvas, pipeline: { ...pipeline, minSizeFrac, imageW: canvas.width, imageH: canvas.height } };
+  return { cells, cellThresh, maskCanvas, pipeline: { ...pipeline, imageW: canvas.width, imageH: canvas.height } };
 }
 
 // Otsu's method applied to an arbitrary array of continuous values instead
@@ -443,7 +326,7 @@ function renderResult(expectedTotal) {
   el("totalResult").textContent = `${count} marked`;
   let note = `${state.cells.length} boxes found — ${count} look marked, ${state.cells.length - count} blank.`;
   if (expectedTotal && state.cells.length !== expectedTotal) {
-    note += ` (You said ${expectedTotal} total — closest match found, off by ${Math.abs(state.cells.length - expectedTotal)}. Check the photo covers every box clearly.)`;
+    note += ` (You said ${expectedTotal} total — found ${state.cells.length}, off by ${Math.abs(state.cells.length - expectedTotal)}. Check the photo covers every box clearly.)`;
   }
   el("detectedNote").textContent = note;
 }
@@ -485,7 +368,7 @@ function buildDiagnosticsText() {
   const med = (arr) => arr[Math.floor(arr.length / 2)];
 
   const sample = cells.slice(0, 25).map((c) =>
-    `  x=${c.x} y=${c.y} w=${c.w} h=${c.h} ink=${c.ink.toFixed(3)} green=${c.green.toFixed(3)} score=${c.score.toFixed(3)} marked=${c.score >= effectiveThresh}`
+    `  x=${c.x} y=${c.y} w=${c.w} h=${c.h} fill=${c.fill.toFixed(3)} green=${c.green.toFixed(3)} score=${c.score.toFixed(3)} marked=${c.score >= effectiveThresh}`
   );
 
   return [
@@ -493,13 +376,13 @@ function buildDiagnosticsText() {
     ``,
     `Image: ${W}x${H}`,
     `Expected total given: ${state.expectedTotal ?? "(none)"}`,
-    `Pipeline (last run): rawContours=${state.pipeline.rawContours} holeContours=${state.pipeline.holeContours} afterMinSize=${state.pipeline.afterMinSize} mergedFragments=${state.pipeline.mergedFragments} afterShapeFilter=${state.pipeline.afterShapeFilter} minSizeFrac=${state.pipeline.minSizeFrac}`,
+    `Pipeline (last run): rawComponents=${state.pipeline.rawComponents} plausibleSized=${state.pipeline.plausibleSized} modeWidth=${state.pipeline.modeWidth} afterShapeFilter=${state.pipeline.afterShapeFilter}`,
     `Detected cells: ${cells.length}`,
     `Cell size: width min=${widths[0]} median=${med(widths)} max=${widths[widths.length - 1]} | height min=${heights[0]} median=${med(heights)} max=${heights[heights.length - 1]}`,
     `Classification threshold (auto + slider adjust): ${effectiveThresh.toFixed(3)} (auto=${state.cellThresh.toFixed(3)}, slider adjust=${state.adjust.toFixed(3)})`,
     `Marked: ${cells.filter((c) => c.score >= effectiveThresh).length} / ${cells.length}`,
     ``,
-    `Mark-score histogram (0=blank, 1=marked; score = max of grayscale ink and greenness):`,
+    `Mark-score histogram (0=blank, 1=marked; score = max of blob fill ratio and greenness):`,
     ...histLines,
     ``,
     `Spatial density (cells found per region, image divided into a ${gridCols}x${gridRows} grid, top-left to bottom-right):`,

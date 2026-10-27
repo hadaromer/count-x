@@ -11,9 +11,8 @@ browser — nothing gets uploaded anywhere.
 1. Upload a photo. That's it — it finds every box and counts the marked
    ones automatically.
 2. If you happen to know the total number of boxes (a ballot, an
-   attendance sheet with a fixed roster, etc.), enter it — optional, but it
-   helps the detector calibrate, especially on forms with small printed
-   text (reference numbers, labels) right next to each box.
+   attendance sheet with a fixed roster, etc.), enter it — optional, shown
+   next to the result as a sanity check, doesn't change detection.
 3. The photo shows every box it found outlined: thick green for boxes it
    thinks are marked, thin blue for blank ones. Check it against the
    actual photo.
@@ -26,70 +25,60 @@ it.
 
 ## How it works
 
-No server, no accounts, no file uploads — it's a static page. For the
+No server, no accounts, no file uploads — it's a static page. It does
+**not** try to reconstruct the grid of boxes first and then inspect each
+one — several versions did, built around finding each box's border as a
+closed shape (a "hole" in the thresholded image). That approach kept
+fighting itself: marking a box is specifically what damages its border's
+hole, so detection and classification were working against each other,
+and every fix for one side tended to let through false positives from a
+form's printed labels. Measuring how inked each blob in the photo actually
+is, directly, turned out to be both simpler and far more accurate. For the
 photo you upload, it:
 
 1. Thresholds it to a binary foreground mask (ink and borders both count as
    "foreground," blank paper doesn't).
-2. Strips that mask down to thin strokes only, via `cv.distanceTransform`
-   (each foreground pixel's distance to the nearest background pixel —
-   low for a thin printed border or pen line, high for a solid interior
-   fill or thick ink). A marked box's own ink — a highlighter fill, or an
-   X whose diagonals touch the border at several points — otherwise
-   destroys or fragments that box's enclosed hole, which would make a
-   marked box invisible to hole-based detection rather than just
-   misclassified. Thinning first recovers the border, and its hole,
-   regardless of what's marked inside it.
-3. Finds every closed shape in the thinned mask as a contour
-   (`cv.findContours`, via [OpenCV.js](https://docs.opencv.org/4.x/d5/d10/tutorial_js_root.html)),
-   using `RETR_CCOMP` and keeping each box's enclosed interior (a "hole" in
-   the border mesh) rather than its own outer ring. On a densely packed
-   form, adjacent boxes' borders often touch after the photo is resized —
-   that can fuse the whole grid into one connected blob under a simpler
-   "each box's own outer ring" approach, which catastrophically
-   undercounts. A box's hole stays correctly segmented even when the
-   surrounding mesh is fully fused, so this holds up regardless of how
-   tightly packed the boxes are.
-4. Keeps only the candidates big enough to plausibly be a box a person
-   could mark with a pen, with a high fill ratio (contour area vs. its own
-   bounding box) and a close-to-square aspect ratio. A real box hole after
-   thinning is a near-complete rectangle; a printed label character's hole
-   (0, 6, 8, 9 all have one) almost never reaches that fill ratio even
-   when its size happens to overlap a small box's — fill ratio and shape
-   turn out to separate the two far more reliably than size alone,
-   especially at low photo resolution where a dense form's label text and
-   its checkboxes can be close in size.
-5. Handles boxes whose hole got sliced into several undersized fragments
-   by a mark that touches the border at multiple points (e.g. an X corner
-   to corner): groups leftover fragments by actual spatial adjacency
-   (bounding boxes touching or overlapping within a tight tolerance, far
-   smaller than the real gap between adjacent boxes) rather than by
-   `findContours`' own parent index, which turned out not to be reliable
-   evidence of belonging to the same cell. A group's combined footprint is
-   accepted as one cell if it's plausibly box-shaped and sized — but a
-   *lone* low-fill fragment is left alone rather than merged, since on its
-   own it's more likely a digit than a sliced-open box.
-6. For each box kept, crops an inset region (avoiding its own border) and
-   measures two independent signals: grayscale darkness (pen/pencil ink)
-   and "greenness" (how much the average color leans green — for
-   highlighter-style marks that are barely darker than blank paper and so
-   are invisible to a pure darkness score). A box's mark score is the
-   stronger of the two.
-7. Finds the natural split between "blank" and "marked" scores via a
-   second, cell-level Otsu threshold over all the boxes' mark scores (not
-   a fixed cutoff against pure white) — self-calibrates to whatever a
-   blank box actually looks like in this specific photo (handles non-white
-   cell fills, shadows, scan tint) and to whatever fraction of boxes are
-   actually marked.
+2. Takes every connected blob in that mask as a candidate
+   (`cv.connectedComponentsWithStats`, via [OpenCV.js](https://docs.opencv.org/4.x/d5/d10/tutorial_js_root.html))
+   — no contour-hierarchy or hole reasoning at all. A blank box's blob is
+   just its thin border ring: a low fraction of its own bounding box is
+   actually inked. A marked box's blob includes whatever's inside it — a
+   highlighter fill or an X — so a much higher fraction of it is inked.
+   That fill ratio (blob area vs. its own bounding box) is the core
+   signal, and empirically separates blank from marked far more cleanly
+   than measuring interior darkness after trying to locate a border first.
+3. Excludes blobs that are too small or too large to plausibly be a box a
+   person could mark with a pen — a generous range, since the photo's
+   *actual* box size is then found from the mode of blob widths within
+   that range, rather than assumed in advance or anchored on a median a
+   form's printed labels could contaminate (real boxes are far more
+   uniform in size than scattered label text, so they form a sharp peak
+   even when label-sized blobs outnumber them).
+4. For each box kept, crops an inset region (avoiding its own border) and
+   measures a second, independent signal: how much the average color
+   leans green — for highlighter-style marks that are barely darker than
+   blank paper and so don't move the fill ratio much. A box's mark score
+   is the stronger of the two signals.
+5. Finds the natural split between "blank" and "marked" scores via a
+   cell-level Otsu threshold over all the boxes' mark scores (not a fixed
+   cutoff) — self-calibrates to whatever a blank box actually looks like
+   in this specific photo and to whatever fraction of boxes are actually
+   marked.
 
-This is a "how dark/colored is it" measurement, not real OCR — it doesn't
+This is a "how inked/colored is it" measurement, not real OCR — it doesn't
 care whether the mark is an X, a checkmark, a scribble, or a highlighter
 fill, just whether there's visible ink or color in the box. Validated
-against synthetic ground-truth grids across varied pen widths, cell sizes,
-rotation, mark density from 5%-70%, non-white cell fills, zero-gap touching
-borders, printed reference numbers with their own enclosed holes sitting
-next to every box, and marks that fully fill or fragment a box's hole
-(highlighter fills, corner-touching X's).
+against a synthetic ground-truth form built to stress the hardest part of
+this specific problem: a dense grid with a real printed reference number
+(actual rendered digit glyphs) sitting right next to every box — across
+several random mark layouts, zero false positives and zero misclassified
+boxes.
+
+Open gap: this doesn't yet correct for unevenly lit photos (a strong
+shadow or glare across part of the page) — adaptive thresholding and
+illumination normalization were both tried and both broke the fill-ratio
+classification worse than the shadow itself did, so for now a very uneven
+photo may still undercount in the affected region.
 
 ## Running locally
 
