@@ -46,6 +46,13 @@
         </div>
         <div id="totalResult" class="total-result"></div>
         <p id="detectedNote" class="hint"></p>
+
+        <div class="controls-row">
+          <button id="copyDiagnosticsBtn" class="btn btn-ghost">Copy diagnostic data</button>
+          <span id="diagnosticsStatus" class="hint"></span>
+        </div>
+        <p class="hint">If the count looks wrong, tap this and paste the result into chat — it's a text summary of what the detector found (sizes, darkness scores, where on the page), no image data.</p>
+        <textarea id="diagnosticsFallback" readonly hidden rows="10" style="width:100%; font-family:monospace; font-size:0.75rem;"></textarea>
       </div>
     </section>
   </main>

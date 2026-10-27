@@ -13,6 +13,8 @@ const state = {
   cells: null,     // [{x,y,w,h,ink}] in workCanvas pixel coordinates, after detection
   cellThresh: 0.5, // auto-computed split point between "blank" and "marked" ink scores
   adjust: 0,       // user's slider offset from cellThresh, -0.15..+0.15
+  pipeline: null,  // stage counts from the most recent detection run, for diagnostics
+  expectedTotal: null,
 };
 state.workCtx = state.workCanvas.getContext("2d");
 state.viewCtx = state.viewCanvas.getContext("2d");
@@ -93,6 +95,8 @@ el("expectedTotal").addEventListener("change", () => {
   if (state.cells) detectAndClassify(); // re-run detection using the new target
 });
 
+el("copyDiagnosticsBtn").addEventListener("click", copyDiagnostics);
+
 // ── Detection ────────────────────────────────────────────────────────────────
 
 function detectAndClassify() {
@@ -102,12 +106,14 @@ function detectAndClassify() {
   setTimeout(() => {
     const expectedRaw = el("expectedTotal").value.trim();
     const expectedTotal = expectedRaw ? Math.max(1, parseInt(expectedRaw, 10)) : null;
+    state.expectedTotal = expectedTotal;
     try {
-      const { cells, cellThresh } = expectedTotal
+      const { cells, cellThresh, pipeline } = expectedTotal
         ? findCellsBestMatch(state.workCanvas, expectedTotal)
         : findCells(state.workCanvas, DEFAULT_MIN_SIZE_FRAC);
       state.cells = cells;
       state.cellThresh = cellThresh;
+      state.pipeline = pipeline;
     } catch (err) {
       console.error(err);
       el("status").textContent = "Something went wrong analyzing that photo — try a different one.";
@@ -179,12 +185,6 @@ function findCellsBestMatch(canvas, expectedTotal) {
 // whatever a blank box actually looks like in this specific photo (handles
 // non-white cell fills, shadows, scan tint) and to whatever fraction of
 // boxes are actually marked, rather than assuming marks are a minority.
-//
-// Validated against synthetic ground-truth grids across pen widths, cell
-// sizes, rotation, mark density from 5%-70%, non-white cell fills, adjacent
-// cells with zero gap between borders, and real printed reference numbers
-// (including digits with their own holes) sitting next to every box —
-// exact counts in all cases.
 function findCells(canvas, minSizeFrac) {
   const src = cv.imread(canvas);
   const gray = new cv.Mat();
@@ -199,13 +199,16 @@ function findCells(canvas, minSizeFrac) {
   cv.findContours(binary, contours, hierarchy, cv.RETR_CCOMP, cv.CHAIN_APPROX_SIMPLE);
 
   const minDim = minSizeFrac * Math.min(canvas.width, canvas.height);
+  const pipeline = { rawContours: contours.size(), holeContours: 0, afterMinSize: 0, afterShapeFilter: 0 };
   const candidates = [];
   for (let i = 0; i < contours.size(); i++) {
     const cnt = contours.get(i);
     const parent = hierarchy.data32S[i * 4 + 3];
     if (parent !== -1) {
+      pipeline.holeContours++;
       const rect = cv.boundingRect(cnt);
       if (rect.width >= minDim && rect.height >= minDim) {
+        pipeline.afterMinSize++;
         const rectArea = rect.width * rect.height;
         const area = cv.contourArea(cnt);
         candidates.push({
@@ -230,6 +233,7 @@ function findCells(canvas, minSizeFrac) {
       c.fillRatio >= 0.5
     );
   }
+  pipeline.afterShapeFilter = cells.length;
 
   const insetFrac = 0.12;
   for (const c of cells) {
@@ -249,7 +253,7 @@ function findCells(canvas, minSizeFrac) {
   src.delete(); gray.delete(); blurred.delete(); binary.delete();
   contours.delete(); hierarchy.delete();
 
-  return { cells, cellThresh };
+  return { cells, cellThresh, pipeline: { ...pipeline, minSizeFrac, imageW: canvas.width, imageH: canvas.height } };
 }
 
 // Otsu's method applied to an arbitrary array of continuous values instead
@@ -305,4 +309,84 @@ function renderResult(expectedTotal) {
     note += ` (You said ${expectedTotal} total — closest match found, off by ${Math.abs(state.cells.length - expectedTotal)}. Check the photo covers every box clearly.)`;
   }
   el("detectedNote").textContent = note;
+}
+
+// ── Diagnostics ──────────────────────────────────────────────────────────────
+// Lets a user paste real data back to the developer when something's off,
+// since Claude Code has no way to read photos shared in conversation.
+
+function buildDiagnosticsText() {
+  const cells = state.cells;
+  const W = state.workCanvas.width, H = state.workCanvas.height;
+  const effectiveThresh = state.cellThresh + state.adjust;
+
+  // ink-score histogram, 20 buckets 0..1
+  const bucketCount = 20;
+  const buckets = new Array(bucketCount).fill(0);
+  for (const c of cells) {
+    const b = Math.min(bucketCount - 1, Math.max(0, Math.floor(c.ink * bucketCount)));
+    buckets[b]++;
+  }
+  const histLines = buckets.map((n, i) => {
+    const lo = (i / bucketCount).toFixed(2);
+    const marker = (i / bucketCount) <= effectiveThresh && effectiveThresh < ((i + 1) / bucketCount) ? "  <- threshold" : "";
+    return `  ${lo}: ${"#".repeat(Math.min(50, n))} (${n})${marker}`;
+  });
+
+  // coarse 10x8 spatial density grid, to spot whole missing regions
+  const gridCols = 10, gridRows = 8;
+  const density = Array.from({ length: gridRows }, () => new Array(gridCols).fill(0));
+  for (const c of cells) {
+    const gx = Math.min(gridCols - 1, Math.floor(((c.x + c.w / 2) / W) * gridCols));
+    const gy = Math.min(gridRows - 1, Math.floor(((c.y + c.h / 2) / H) * gridRows));
+    density[gy][gx]++;
+  }
+  const densityLines = density.map((row) => row.map((n) => String(n).padStart(3)).join(" "));
+
+  const widths = cells.map((c) => c.w).sort((a, b) => a - b);
+  const heights = cells.map((c) => c.h).sort((a, b) => a - b);
+  const med = (arr) => arr[Math.floor(arr.length / 2)];
+
+  const sample = cells.slice(0, 25).map((c) =>
+    `  x=${c.x} y=${c.y} w=${c.w} h=${c.h} ink=${c.ink.toFixed(3)} marked=${c.ink >= effectiveThresh}`
+  );
+
+  return [
+    `Count X diagnostics — ${new Date().toISOString()}`,
+    ``,
+    `Image: ${W}x${H}`,
+    `Expected total given: ${state.expectedTotal ?? "(none)"}`,
+    `Pipeline (last run): rawContours=${state.pipeline.rawContours} holeContours=${state.pipeline.holeContours} afterMinSize=${state.pipeline.afterMinSize} afterShapeFilter=${state.pipeline.afterShapeFilter} minSizeFrac=${state.pipeline.minSizeFrac}`,
+    `Detected cells: ${cells.length}`,
+    `Cell size: width min=${widths[0]} median=${med(widths)} max=${widths[widths.length - 1]} | height min=${heights[0]} median=${med(heights)} max=${heights[heights.length - 1]}`,
+    `Classification threshold (auto + slider adjust): ${effectiveThresh.toFixed(3)} (auto=${state.cellThresh.toFixed(3)}, slider adjust=${state.adjust.toFixed(3)})`,
+    `Marked: ${cells.filter((c) => c.ink >= effectiveThresh).length} / ${cells.length}`,
+    ``,
+    `Ink-score histogram (0=white, 1=black):`,
+    ...histLines,
+    ``,
+    `Spatial density (cells found per region, image divided into a ${gridCols}x${gridRows} grid, top-left to bottom-right):`,
+    ...densityLines,
+    ``,
+    `First 25 detected cells (raw):`,
+    ...sample,
+  ].join("\n");
+}
+
+async function copyDiagnostics() {
+  if (!state.cells) return;
+  const text = buildDiagnosticsText();
+  try {
+    await navigator.clipboard.writeText(text);
+    el("diagnosticsStatus").textContent = "Copied — paste it in chat.";
+  } catch {
+    // Clipboard API can be blocked in some contexts; fall back to a visible,
+    // selectable textarea the user can copy from manually.
+    const ta = el("diagnosticsFallback");
+    ta.value = text;
+    ta.hidden = false;
+    ta.focus();
+    ta.select();
+    el("diagnosticsStatus").textContent = "Couldn't copy automatically — select all the text below and copy it.";
+  }
 }
