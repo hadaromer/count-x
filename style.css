@@ -3,10 +3,7 @@
   --muted: #6b7280;
   --border: #e2e4e9;
   --brand: #2563eb;
-  --brand-dark: #1d4ed8;
   --bg: #f7f8fa;
-  --ok: #16a34a;
-  --warn: #d97706;
 }
 
 * { box-sizing: border-box; }
@@ -75,13 +72,6 @@ main {
 .btn:hover:not(:disabled) { background: #f0f1f3; }
 .btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
-.btn-primary {
-  background: var(--brand);
-  border-color: var(--brand);
-  color: white;
-}
-.btn-primary:hover:not(:disabled) { background: var(--brand-dark); }
-
 .btn-ghost {
   background: transparent;
 }
@@ -96,7 +86,6 @@ main {
   opacity: 0;
   cursor: pointer;
 }
-.file-label input[type="file"]:disabled { cursor: not-allowed; }
 .file-label span {
   display: inline-block;
   padding: 0.5rem 1rem;
@@ -124,54 +113,7 @@ main {
 #viewCanvas {
   max-width: 100%;
   display: block;
-  cursor: crosshair;
 }
-
-.pending-form {
-  background: #eff6ff;
-  border: 1px solid #bfdbfe;
-  border-radius: 8px;
-  padding: 1rem;
-  margin-bottom: 1rem;
-  display: flex;
-  align-items: center;
-  gap: 0.75rem;
-  flex-wrap: wrap;
-  font-size: 0.9rem;
-}
-
-.pending-form label {
-  display: flex;
-  align-items: center;
-  gap: 0.4rem;
-}
-
-.pending-form input[type="number"] {
-  width: 4.5rem;
-  padding: 0.3rem 0.5rem;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-}
-
-h2 {
-  font-size: 1.1rem;
-  margin: 1.5rem 0 0.75rem;
-}
-
-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 0.9rem;
-  margin-bottom: 1rem;
-}
-
-th, td {
-  text-align: left;
-  padding: 0.5rem 0.6rem;
-  border-bottom: 1px solid var(--border);
-}
-
-th { color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.03em; }
 
 .threshold-label {
   display: flex;
@@ -184,30 +126,7 @@ th { color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: u
   font-size: 2rem;
   font-weight: 700;
   color: var(--brand);
-  margin-bottom: 1rem;
-}
-
-.region-results {
-  display: flex;
-  flex-direction: column;
-  gap: 1.5rem;
-}
-
-.region-result-card {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 1rem;
-}
-
-.region-result-card h3 {
-  margin: 0 0 0.5rem;
-  font-size: 0.95rem;
-}
-
-.region-result-card canvas {
-  max-width: 100%;
-  border: 1px solid var(--border);
-  border-radius: 4px;
+  margin-bottom: 0.25rem;
 }
 
 footer {
@@ -215,13 +134,4 @@ footer {
   color: var(--muted);
   font-size: 0.8rem;
   padding-bottom: 2rem;
-}
-
-.link-btn {
-  background: none;
-  border: none;
-  color: #dc2626;
-  cursor: pointer;
-  font-size: 0.85rem;
-  padding: 0;
 }
