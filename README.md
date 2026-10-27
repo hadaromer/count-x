@@ -25,60 +25,57 @@ it.
 
 ## How it works
 
-No server, no accounts, no file uploads — it's a static page. It does
-**not** try to reconstruct the grid of boxes first and then inspect each
-one — several versions did, built around finding each box's border as a
-closed shape (a "hole" in the thresholded image). That approach kept
-fighting itself: marking a box is specifically what damages its border's
-hole, so detection and classification were working against each other,
-and every fix for one side tended to let through false positives from a
-form's printed labels. Measuring how inked each blob in the photo actually
-is, directly, turned out to be both simpler and far more accurate. For the
-photo you upload, it:
+No server, no accounts, no file uploads — it's a static page.
 
-1. Thresholds it to a binary foreground mask (ink and borders both count as
-   "foreground," blank paper doesn't).
-2. Takes every connected blob in that mask as a candidate
-   (`cv.connectedComponentsWithStats`, via [OpenCV.js](https://docs.opencv.org/4.x/d5/d10/tutorial_js_root.html))
-   — no contour-hierarchy or hole reasoning at all. A blank box's blob is
-   just its thin border ring: a low fraction of its own bounding box is
-   actually inked. A marked box's blob includes whatever's inside it — a
-   highlighter fill or an X — so a much higher fraction of it is inked.
-   That fill ratio (blob area vs. its own bounding box) is the core
-   signal, and empirically separates blank from marked far more cleanly
-   than measuring interior darkness after trying to locate a border first.
-3. Excludes blobs that are too small or too large to plausibly be a box a
-   person could mark with a pen — a generous range, since the photo's
-   *actual* box size is then found from the mode of blob widths within
-   that range, rather than assumed in advance or anchored on a median a
-   form's printed labels could contaminate (real boxes are far more
-   uniform in size than scattered label text, so they form a sharp peak
-   even when label-sized blobs outnumber them).
-4. For each box kept, crops an inset region (avoiding its own border) and
-   measures a second, independent signal: how much the average color
-   leans green — for highlighter-style marks that are barely darker than
-   blank paper and so don't move the fill ratio much. A box's mark score
-   is the stronger of the two signals.
-5. Finds the natural split between "blank" and "marked" scores via a
-   cell-level Otsu threshold over all the boxes' mark scores (not a fixed
-   cutoff) — self-calibrates to whatever a blank box actually looks like
-   in this specific photo and to whatever fraction of boxes are actually
-   marked.
+The default **Grid scan** works the way bubble-sheet / OMR scanners do (see
+e.g. [OMRChecker](https://github.com/Udayraj123/OMRChecker)): it doesn't try
+to recognise each box by its own shape — that's exactly what a mark ruins —
+it finds the lattice the boxes sit on and measures the ink at every position
+on it. The pipeline (`omr.js`, runs identically in the browser and in Node):
 
-This is a "how inked/colored is it" measurement, not real OCR — it doesn't
-care whether the mark is an X, a checkmark, a scribble, or a highlighter
-fill, just whether there's visible ink or color in the box. Validated
-against a synthetic ground-truth form built to stress the hardest part of
-this specific problem: a dense grid with a real printed reference number
-(actual rendered digit glyphs) sitting right next to every box — across
-several random mark layouts, zero false positives and zero misclassified
-boxes.
+1. **Normalize lighting.** Divide the photo by a heavily smoothed copy of
+   itself, so paper is a known level everywhere and a shadow or glare can't
+   change what counts as ink. Ink is anything noticeably darker than that
+   paper level.
+2. **Anchors.** Boxes that are still clean closed squares (the blank ones,
+   typically most of them) show up as holes in the thresholded image. Their
+   typical size is the mode of hole widths — real boxes are far more uniform
+   than printed labels, so they form a sharp peak.
+3. **Lattice.** From the anchors, work out the grid's rotation and pitch,
+   then walk outward cell by cell, giving every position integer grid
+   indices. A position with no anchor (a marked box whose outline got
+   damaged) is re-placed from a local affine fit of the real anchors around
+   it and accepted only if a box outline is actually present there and the
+   lattice continues on at least two sides. Tiny stray lattices (printed
+   text, barcodes, markers) are discarded.
+4. **Measure.** For every lattice cell, take an inset region (staying off
+   its own outline) and measure how much dark ink is in it, plus how green
+   it is (highlighter), both against the normalized paper level.
+5. **Classify.** Blank cells cluster tightly near zero, so the cut sits just
+   above that cluster (with 1-D Otsu to find it) — faint marks still count,
+   and the sensitivity slider moves the cut.
 
-Open gap: this doesn't yet correct for unevenly lit photos (a strong
-shadow or glare across part of the page) — adaptive thresholding and
-illumination normalization were both tried and both broke the fill-ratio
-classification worse than the shadow itself did, so for now a very uneven
-photo may still undercount in the affected region.
+Cells drawn with dashed outlines were placed from the grid rather than seen
+directly. If no usable grid is found, it falls back to the older method and
+says so.
+
+Two older methods are still in the dropdown for comparison. **Box ink**
+classifies each connected blob that looks box-sized by how much of its
+bounding box is inked; **X-shape matching** looks for crossing diagonal
+strokes (Hough lines) plus green blobs. On a realistic synthetic form
+(perspective, shadow, printed numbers, hand-drawn X's) they found 285 and
+120 of 800 boxes versus 800 for the grid scan.
+
+### Testing
+
+`omr.js` has no DOM dependency, so it's tested against the real OpenCV.js
+build in Node on synthetic forms with ground truth: 800 boxes in 8 blocks,
+numbers printed above each box, hand-jittered X's, translucent highlighter,
+random perspective, up to ~5° rotation, a diagonal shadow band, blur, noise
+and JPEG compression, plus lower-resolution, fainter-pen and denser variants.
+All come out at 800/800 positions with at most 2 mark errors. Known weak
+spots: very tightly packed boxes (gap between boxes under ~8px) and layouts
+where printed numbers touch the neighbouring block's boxes.
 
 ## Running locally
 

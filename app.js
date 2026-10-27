@@ -13,7 +13,8 @@ const state = {
   cvReady: false,
   workCanvas: document.createElement("canvas"),
   viewCanvas: document.getElementById("viewCanvas"),
-  method: "blob",  // "blob" (default: classify every box by ink content) or "xshape" (experimental: find X's and green blobs directly)
+  method: "grid",  // "grid" (default: find the lattice, measure every position), "blob" (older: classify detected box blobs) or "xshape" (experimental)
+  fellBack: false, // grid scan found nothing and the blob method ran instead
   cells: null,     // [{x,y,w,h,fill,green,score}] in workCanvas pixel coordinates, after detection
   cellThresh: 0.5, // auto-computed split point between "blank" and "marked" scores
   adjust: 0,       // user's slider offset from cellThresh, -0.15..+0.15
@@ -107,11 +108,14 @@ el("expectedTotal").addEventListener("change", () => {
   if (state.cells) renderResult(state.expectedTotal);
 });
 
+const METHOD_HINTS = {
+  grid: "Works like a bubble-sheet scanner: finds the grid the boxes sit on, then measures the ink inside every grid position — even boxes whose outline an X has damaged.",
+  blob: "Older method: finds each box as a shape and measures how inked it is. Struggles when a mark touches the box outline.",
+  xshape: "Experimental: looks for X-shaped crossing strokes and green highlighter directly, without locating boxes first. In testing this missed more marks and had more false positives than the others — here to compare against your own photo.",
+};
 el("methodSelect").addEventListener("change", (e) => {
   state.method = e.target.value;
-  el("methodHint").textContent = state.method === "xshape"
-    ? "Experimental: looks for X-shaped crossing strokes and green highlighter directly, without locating boxes first. In testing this missed more marks and had more false positives than the default — here to compare against your own photo."
-    : "Finds every box, measures how inked it is. Catches X's, checkmarks, and highlighter fills alike.";
+  el("methodHint").textContent = METHOD_HINTS[state.method];
   if (state.cells) detectAndClassify();
 });
 
@@ -134,9 +138,21 @@ function detectAndClassify() {
     const expectedTotal = expectedRaw ? Math.max(1, parseInt(expectedRaw, 10)) : null;
     state.expectedTotal = expectedTotal;
     try {
-      const { cells, cellThresh, pipeline, maskCanvas } = state.method === "xshape"
-        ? findXShapeMarks(state.workCanvas)
-        : findCells(state.workCanvas);
+      state.fellBack = false;
+      let result;
+      if (state.method === "xshape") {
+        result = findXShapeMarks(state.workCanvas);
+      } else if (state.method === "grid") {
+        result = findGridCells(state.workCanvas);
+        if (result.cells.length < 20) {
+          // no usable grid (too few clean boxes to learn the lattice from) — fall back rather than show nothing
+          result = findCells(state.workCanvas);
+          state.fellBack = true;
+        }
+      } else {
+        result = findCells(state.workCanvas);
+      }
+      const { cells, cellThresh, pipeline, maskCanvas } = result;
       state.cells = cells;
       state.cellThresh = cellThresh;
       state.pipeline = pipeline;
@@ -277,6 +293,23 @@ function findCells(canvas) {
   src.delete(); gray.delete(); blurred.delete(); binary.delete();
 
   return { cells, cellThresh, maskCanvas, pipeline: { ...pipeline, imageW: canvas.width, imageH: canvas.height } };
+}
+
+// Grid scan (see omr.js): find the lattice the boxes sit on and measure every
+// position on it. Browser wrapper around the DOM-free core.
+function findGridCells(canvas) {
+  const src = cv.imread(canvas);
+  let res;
+  try {
+    res = OMR.analyze(cv, src);
+  } finally {
+    src.delete();
+  }
+  const maskCanvas = document.createElement("canvas");
+  maskCanvas.width = canvas.width;
+  maskCanvas.height = canvas.height;
+  if (res.maskMat) { cv.imshow(maskCanvas, res.maskMat); res.maskMat.delete(); }
+  return { cells: res.cells, cellThresh: res.cellThresh, maskCanvas, pipeline: { ...res.pipeline, imageW: canvas.width, imageH: canvas.height } };
 }
 
 // Experimental alternative to findCells: instead of locating every box and
@@ -451,13 +484,18 @@ function renderResult(expectedTotal) {
     if (marked) count++;
     state.viewCtx.strokeStyle = marked ? "#16a34a" : "rgba(37,99,235,0.35)";
     state.viewCtx.lineWidth = marked ? 3 : 1.5;
+    state.viewCtx.setLineDash(c.virtual ? [4, 3] : []);
     state.viewCtx.strokeRect(c.x + 1, c.y + 1, c.w - 2, c.h - 2);
+    state.viewCtx.setLineDash([]);
   }
 
   el("totalResult").textContent = `${count} marked`;
+  const virtualCount = state.cells.filter((c) => c.virtual).length;
   let note = state.method === "xshape"
     ? `${count} marks found directly (X-shapes and green blobs) — this mode doesn't locate blank boxes.`
     : `${state.cells.length} boxes found — ${count} look marked, ${state.cells.length - count} blank.`;
+  if (virtualCount) note += ` (${virtualCount} boxes were placed from the grid rather than seen directly — dashed outlines.)`;
+  if (state.fellBack) note = "No regular grid found, so the older box-by-box method was used instead. " + note;
   if (expectedTotal) {
     const against = state.method === "xshape" ? count : state.cells.length;
     if (against !== expectedTotal) {
@@ -506,7 +544,9 @@ function buildDiagnosticsText() {
   const sample = cells.slice(0, 25).map((c) => {
     const extra = state.method === "xshape"
       ? `kind=${c.kind}`
-      : `fill=${c.fill.toFixed(3)} green=${c.green.toFixed(3)}`;
+      : c.fill === undefined
+        ? `ink=${c.ink.toFixed(3)} green=${c.green.toFixed(3)} virtual=${!!c.virtual}`
+        : `fill=${c.fill.toFixed(3)} green=${c.green.toFixed(3)}`;
     return `  x=${c.x} y=${c.y} w=${c.w} h=${c.h} ${extra} score=${c.score.toFixed(3)} marked=${c.score >= effectiveThresh}`;
   });
 
@@ -515,16 +555,18 @@ function buildDiagnosticsText() {
     ``,
     `Image: ${W}x${H}`,
     `Expected total given: ${state.expectedTotal ?? "(none)"}`,
-    `Method: ${state.method}`,
-    state.method === "xshape"
-      ? `Pipeline (last run): xCandidates=${state.pipeline.xCandidates} greenCandidates=${state.pipeline.greenCandidates} afterShapeFilter=${state.pipeline.afterShapeFilter}`
-      : `Pipeline (last run): rawComponents=${state.pipeline.rawComponents} plausibleSized=${state.pipeline.plausibleSized} modeWidth=${state.pipeline.modeWidth} afterShapeFilter=${state.pipeline.afterShapeFilter}`,
+    `Method: ${state.method}${state.fellBack ? " (grid found nothing, fell back to blob)" : ""}`,
+    state.pipeline.anchors !== undefined
+      ? `Grid: anchors=${state.pipeline.anchors} virtual=${state.pipeline.virtual} components=${state.pipeline.components} cells=${state.pipeline.keptCells} boxSize=${state.pipeline.boxSize} paperLevel=${state.pipeline.paperLevel} rotation=${(state.pipeline.theta || 0).toFixed(1)}deg pitch=${(state.pipeline.pitchU || 0).toFixed(1)}x${(state.pipeline.pitchV || 0).toFixed(1)}`
+      : state.method === "xshape"
+        ? `Pipeline (last run): xCandidates=${state.pipeline.xCandidates} greenCandidates=${state.pipeline.greenCandidates} afterShapeFilter=${state.pipeline.afterShapeFilter}`
+        : `Pipeline (last run): rawComponents=${state.pipeline.rawComponents} plausibleSized=${state.pipeline.plausibleSized} modeWidth=${state.pipeline.modeWidth} afterShapeFilter=${state.pipeline.afterShapeFilter}`,
     `Detected cells: ${cells.length}`,
     `Cell size: width min=${widths[0]} median=${med(widths)} max=${widths[widths.length - 1]} | height min=${heights[0]} median=${med(heights)} max=${heights[heights.length - 1]}`,
     `Classification threshold (auto + slider adjust): ${effectiveThresh.toFixed(3)} (auto=${state.cellThresh.toFixed(3)}, slider adjust=${state.adjust.toFixed(3)})`,
     `Marked: ${cells.filter((c) => c.score >= effectiveThresh).length} / ${cells.length}`,
     ``,
-    `Mark-score histogram (0=blank, 1=marked; score = max of blob fill ratio and greenness):`,
+    `Mark-score histogram (0=blank, 1=marked; score = max of ink and greenness):`,
     ...histLines,
     ``,
     `Spatial density (cells found per region, image divided into a ${gridCols}x${gridRows} grid, top-left to bottom-right):`,

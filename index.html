@@ -36,11 +36,12 @@
         <label class="threshold-label">
           Detection method
           <select id="methodSelect">
-            <option value="blob">Box ink (default)</option>
+            <option value="grid">Grid scan (default)</option>
+            <option value="blob">Box ink (older)</option>
             <option value="xshape">X-shape matching (experimental)</option>
           </select>
         </label>
-        <span class="hint" id="methodHint">Finds every box, measures how inked it is. Catches X's, checkmarks, and highlighter fills alike.</span>
+        <span class="hint" id="methodHint">Works like a bubble-sheet scanner: finds the grid the boxes sit on, then measures the ink inside every grid position — even boxes whose outline an X has damaged.</span>
       </div>
 
       <div class="canvas-wrap" id="canvasWrap" hidden>
@@ -84,6 +85,7 @@
     };
   </script>
   <script async src="https://docs.opencv.org/4.9.0/opencv.js"></script>
+  <script src="omr.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
